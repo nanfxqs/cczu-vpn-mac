@@ -17,6 +17,7 @@ use tokio::{
 
 use super::{
     Response, SOCKET,
+    connection::{ConnectionInfo, ConnectionManager, TestScenario},
     credentials::{self, CredentialStore, Credentials},
 };
 
@@ -26,6 +27,12 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    Connect {
+        credentials: Option<Credentials>,
+        #[serde(default)]
+        ignore_saved: bool,
+    },
+    Disconnect,
     Status,
     CredentialsSet {
         credentials: Credentials,
@@ -43,21 +50,25 @@ pub struct Status {
     pub service: String,
     pub connection: String,
     pub last_error: Option<String>,
+    pub connection_info: Option<ConnectionInfo>,
 }
 
 pub struct DaemonState {
     pub status: Mutex<Status>,
     pub credentials: Mutex<CredentialStore>,
+    pub connection: Mutex<ConnectionManager>,
 }
 
 impl DaemonState {
-    fn new(directory: PathBuf) -> Self {
+    fn new(directory: PathBuf, scenario: Option<TestScenario>) -> Self {
         Self {
             credentials: Mutex::new(CredentialStore::new(directory)),
+            connection: Mutex::new(ConnectionManager::new(scenario)),
             status: Mutex::new(Status {
                 service: "running".into(),
                 connection: "disconnected".into(),
                 last_error: None,
+                connection_info: None,
             }),
         }
     }
@@ -69,7 +80,12 @@ pub fn effective_uid() -> u32 {
 }
 
 pub async fn request(socket: &Path, request: &Request) -> Response {
-    let result = tokio::time::timeout(CONTROL_TIMEOUT, async {
+    let response_timeout = if matches!(request, Request::Connect { .. } | Request::Disconnect) {
+        Duration::from_secs(90)
+    } else {
+        CONTROL_TIMEOUT
+    };
+    let result = tokio::time::timeout(response_timeout, async {
         let mut stream = UnixStream::connect(socket).await?;
         let mut encoded = serde_json::to_vec(request)?;
         encoded.push(b'\n');
@@ -113,7 +129,79 @@ async fn serve_client(stream: UnixStream, state: Arc<DaemonState>) -> Result<()>
         Response::error("invalid_arguments", "Invalid or oversized control request")
     } else {
         match serde_json::from_slice::<Request>(&line) {
-            Ok(Request::Status) => Response::success(state.status.lock().await.clone()),
+            Ok(Request::Connect {
+                credentials,
+                ignore_saved,
+            }) => {
+                let resolved = state
+                    .credentials
+                    .lock()
+                    .await
+                    .resolve(credentials, ignore_saved);
+                match resolved {
+                    Ok(Some(credentials)) => {
+                        let mut connection = state.connection.lock().await;
+                        state.status.lock().await.connection = "connecting".into();
+                        match connection.connect(credentials).await {
+                            Ok(info) => {
+                                let mut status = state.status.lock().await;
+                                status.connection = "connected".into();
+                                status.last_error = None;
+                                status.connection_info = Some(info);
+                                Response::success(status.clone())
+                            }
+                            Err(err) => {
+                                let mut status = state.status.lock().await;
+                                status.connection = "failed".into();
+                                status.connection_info = None;
+                                status.last_error = Some(err.to_string());
+                                Response::error("connection_failed", err.to_string())
+                            }
+                        }
+                    }
+                    Ok(None) => Response::error(
+                        "credentials_required",
+                        "Provide campus credentials before connecting",
+                    ),
+                    Err(_) => Response::error(
+                        "credential_store_error",
+                        "Could not read campus credentials",
+                    ),
+                }
+            }
+            Ok(Request::Disconnect) => {
+                let mut connection = state.connection.lock().await;
+                state.status.lock().await.connection = "disconnecting".into();
+                match connection.disconnect().await {
+                    Ok(()) => {
+                        let mut status = state.status.lock().await;
+                        status.connection = "disconnected".into();
+                        status.connection_info = None;
+                        Response::success(status.clone())
+                    }
+                    Err(err) => {
+                        let mut status = state.status.lock().await;
+                        status.connection = "failed".into();
+                        status.last_error = Some(err.to_string());
+                        Response::error("disconnect_failed", err.to_string())
+                    }
+                }
+            }
+            Ok(Request::Status) => {
+                if let Ok(mut connection) = state.connection.try_lock()
+                    && connection.forwarding_failed()
+                {
+                    let cleanup = connection.disconnect().await;
+                    let mut status = state.status.lock().await;
+                    status.connection = "failed".into();
+                    status.last_error = Some(match cleanup {
+                        Ok(()) => "VPN packet forwarding stopped; connection cleaned up".into(),
+                        Err(error) => format!("VPN packet forwarding stopped; {error}"),
+                    });
+                    status.connection_info = None;
+                }
+                Response::success(state.status.lock().await.clone())
+            }
             Ok(Request::CredentialsSet { credentials, save }) => {
                 state.credentials.lock().await.set(credentials, save)
             }
@@ -148,7 +236,7 @@ impl Drop for SocketGuard {
     }
 }
 
-pub async fn run_daemon(test_socket: Option<PathBuf>) -> Result<()> {
+pub async fn run_daemon(test_socket: Option<PathBuf>, test_scenario: TestScenario) -> Result<()> {
     let test_mode = test_socket.is_some();
     ensure!(
         test_mode != (effective_uid() == 0),
@@ -200,7 +288,10 @@ pub async fn run_daemon(test_socket: Option<PathBuf>) -> Result<()> {
         &socket,
         fs::Permissions::from_mode(if test_mode { 0o600 } else { 0o666 }),
     )?;
-    let state = Arc::new(DaemonState::new(credential_directory));
+    let state = Arc::new(DaemonState::new(
+        credential_directory,
+        if test_mode { Some(test_scenario) } else { None },
+    ));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     // A detached service does not treat an SSH session hangup as a VPN shutdown.
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
@@ -216,5 +307,6 @@ pub async fn run_daemon(test_socket: Option<PathBuf>) -> Result<()> {
             _ = hangup.recv() => {},
         }
     }
+    state.connection.lock().await.disconnect().await?;
     Ok(())
 }

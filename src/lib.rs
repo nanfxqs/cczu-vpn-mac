@@ -3,6 +3,7 @@ uniffi::setup_scaffolding!("cczuvpnproto");
 pub mod auth;
 pub mod bindings;
 pub mod diag;
+pub mod routes;
 pub mod types;
 pub mod vpn;
 

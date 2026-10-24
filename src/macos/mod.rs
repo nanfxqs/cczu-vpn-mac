@@ -4,8 +4,10 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod connection;
 pub mod credentials;
 mod install;
+pub mod network;
 pub mod service;
 
 pub const SOCKET: &str = "/var/run/cczu-vpn/control.sock";
@@ -27,6 +29,15 @@ pub struct Args {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Establish a campus VPN and wait until its network configuration is ready.
+    Connect {
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long)]
+        ignore_saved: bool,
+    },
+    /// Disconnect the campus VPN while keeping the control service running.
+    Disconnect,
     /// Manage shared campus credentials without a desktop keychain.
     Credentials {
         #[command(subcommand)]
@@ -39,6 +50,13 @@ pub enum Command {
         /// Isolated unprivileged service for offline development only.
         #[arg(long, hide = true)]
         test_socket: Option<PathBuf>,
+        #[arg(
+            long,
+            hide = true,
+            requires = "test_socket",
+            default_value = "disabled"
+        )]
+        test_scenario: connection::TestScenario,
     },
     /// Install, stop or remove the system service (requires administrator privileges).
     Service {
@@ -142,6 +160,34 @@ pub async fn run() -> i32 {
         }
     };
     let response = match args.command {
+        Command::Connect {
+            stdin,
+            ignore_saved,
+        } => {
+            let explicit = if stdin {
+                match credentials::read_stdin() {
+                    Ok(credentials) => Some(credentials),
+                    Err(_) => {
+                        let response = Response::error(
+                            "invalid_credentials",
+                            "Expected campus user and password JSON on standard input",
+                        );
+                        return print_response(&response, args.json);
+                    }
+                }
+            } else {
+                None
+            };
+            service::request(
+                &args.socket,
+                &service::Request::Connect {
+                    credentials: explicit,
+                    ignore_saved,
+                },
+            )
+            .await
+        }
+        Command::Disconnect => service::request(&args.socket, &service::Request::Disconnect).await,
         Command::Credentials { action } => {
             let request = match action {
                 CredentialAction::Set {
@@ -175,16 +221,23 @@ pub async fn run() -> i32 {
             }
         }
         Command::Status => service::request(&args.socket, &service::Request::Status).await,
-        Command::Daemon { test_socket } => match service::run_daemon(test_socket).await {
+        Command::Daemon {
+            test_socket,
+            test_scenario,
+        } => match service::run_daemon(test_socket, test_scenario).await {
             Ok(()) => Response::success(json!({"service": "stopped"})),
             Err(err) => Response::error("operation_failed", format!("{err:#}")),
         },
         Command::Service { action } => install::execute(action),
     };
-    if args.json {
+    print_response(&response, args.json)
+}
+
+fn print_response(response: &Response, json_mode: bool) -> i32 {
+    if json_mode {
         println!(
             "{}",
-            serde_json::to_string(&response).expect("serializable response")
+            serde_json::to_string(response).expect("serializable response")
         );
     } else if response.ok {
         println!(

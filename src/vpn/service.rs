@@ -450,11 +450,20 @@ pub async fn stop_service() -> Result<()> {
 
     match session {
         Some(SessionSlot::Running(handle)) => {
-            let _ = handle.command_tx.send(SessionCommand::Stop).await;
-            handle
-                .task
-                .await
-                .context("session actor task join failed")??;
+            let mut task = handle.task;
+            let _ = time::timeout(
+                Duration::from_secs(2),
+                handle.command_tx.send(SessionCommand::Stop),
+            )
+            .await;
+            match time::timeout(Duration::from_secs(2), &mut task).await {
+                Ok(result) => result.context("session actor task join failed")??,
+                Err(_) => {
+                    task.abort();
+                    let _ = task.await;
+                    bail!("VPN session shutdown timed out; actor was aborted");
+                }
+            }
         }
         Some(SessionSlot::Starting(handle)) => {
             handle.cancel.store(true, Ordering::Relaxed);

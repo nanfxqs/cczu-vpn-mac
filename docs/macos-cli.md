@@ -1,5 +1,27 @@
 # macOS CLI
 
+## Connect and disconnect
+
+After installation and credential initialization, daily operations do not require sudo:
+
+```sh
+cczu-vpn-proto --json connect
+cczu-vpn-proto --json status
+cczu-vpn-proto --json disconnect
+```
+
+`connect` returns success only after authentication, tunnel creation, campus routes and packet forwarding are ready. It does not treat a started process as a connected VPN. Status includes a `connection_info` snapshot with the allocated utun interface, tunnel address/mask/gateway, advertised DNS, actual tunnel peer and campus prefixes; it never includes the password. Website availability is a separate diagnostic from tunnel readiness.
+
+For a one-off account, pass a JSON object containing `user` and `password` to `connect --stdin --ignore-saved` on standard input. This does not save that account. Avoid putting secrets in command arguments or shell history. Missing credentials produce `credentials_required` rather than an interactive prompt.
+
+The native runtime allocates a new utun without selecting another process's interface. It forwards raw IP packets in both directions, preserves TLS verification, and installs only checked campus IPv4 routes plus exact school endpoint protections. The physical gateway/interface are discovered at connection time. Default/broad takeover routes, overlapping local networks, malformed masks and conflicting exact routes fail explicitly. Gateway Fake IP responses also fail with an instruction to check DNS/Fake IP configuration. Existing matching routes are not adopted for cleanup. Successful adds are removed in reverse order only while their prefix/interface/gateway still match.
+
+The runtime does not modify system DNS, default routes, IPv6 configuration or active mihomo configuration. DNS policy preparation and diagnostics are separate from daily VPN connection control. It uses macOS [point-to-point interface routes](https://github.com/apple-oss-distributions/network_cmds/blob/main/route.tproj/route.8) and the existing tun-rs 2.8.3 device API.
+
+Offline connection tests can start an unprivileged isolated daemon with `daemon --test-socket PATH --test-scenario ready`. The explicit `setup-failure`, `unsafe-default`, `local-overlap` and `invalid-mask` scenarios verify failure behavior without touching host networking. The default test scenario is `disabled`, which refuses connection attempts; all test scenario selection requires an isolated test socket and test daemon mode refuses root. Production daemon mode always uses the native backend.
+
+At this stage, native code is compiled on macOS and CLI contracts are tested with the offline runtime. Actual campus access requires the user's login and administrator installation; offline tests alone do not establish that `http://172.22.226.31/` is reachable.
+
 The macOS entrypoint controls a system VPN service. Windows and Linux retain the existing interactive CLI.
 
 Build with `cargo build --release --locked`, then install once:
