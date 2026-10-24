@@ -10,6 +10,8 @@
 
 CCZU WebVPN 隧道客户端的 Rust 开源重实现。
 
+本 macOS 仓库增加了供 agent 调用的 CLI 和 launchd 后台服务。安装、凭据管理、连接控制和诊断见 [macOS 使用文档](docs/macos-cli.md)。
+
 这个项目当前同时提供两条使用路径：
 
 - 一条面向直接使用的 Windows / Linux CLI 客户端路径
