@@ -6,6 +6,7 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::{
     net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -38,14 +39,19 @@ pub struct ConnectionInfo {
 pub struct ConnectionManager {
     scenario: Option<TestScenario>,
     active: Option<ActiveConnection>,
+    directory: PathBuf,
 }
 
 impl ConnectionManager {
-    pub fn new(scenario: Option<TestScenario>) -> Self {
+    pub fn new(scenario: Option<TestScenario>, directory: PathBuf) -> Self {
         Self {
             scenario,
             active: None,
+            directory,
         }
+    }
+    pub async fn recover(&mut self) -> Result<()> {
+        RouteSet::recover(self.directory.clone(), self.scenario.is_some()).await
     }
     pub async fn connect(&mut self, credentials: Credentials) -> Result<ConnectionInfo> {
         if self.forwarding_failed() {
@@ -58,6 +64,8 @@ impl ConnectionManager {
             self.active.is_none(),
             "Previous connection cleanup must finish before connecting again"
         );
+        self.recover().await?;
+        let routes = RouteSet::persistent(self.directory.clone(), self.scenario.is_some())?;
         let active = match self.scenario {
             Some(TestScenario::Disabled) => bail!(
                 "Offline daemon cannot establish a real VPN; choose an explicit offline test scenario"
@@ -65,8 +73,12 @@ impl ConnectionManager {
             Some(scenario) => ActiveConnection::Offline {
                 scenario,
                 info: None,
+                routes,
             },
-            None => ActiveConnection::Native(Box::default()),
+            None => ActiveConnection::Native(Box::new(NativeConnection {
+                routes,
+                ..Default::default()
+            })),
         };
         self.active = Some(active);
         let result = self
@@ -102,6 +114,7 @@ enum ActiveConnection {
     Offline {
         scenario: TestScenario,
         info: Option<ConnectionInfo>,
+        routes: RouteSet,
     },
 }
 
@@ -115,7 +128,11 @@ impl ActiveConnection {
     async fn start(&mut self, credentials: Credentials) -> Result<ConnectionInfo> {
         match self {
             Self::Native(connection) => connection.start(credentials).await,
-            Self::Offline { scenario, info } => {
+            Self::Offline {
+                scenario,
+                info,
+                routes: owned,
+            } => {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 ensure!(
                     !matches!(scenario, TestScenario::SetupFailure),
@@ -149,6 +166,15 @@ impl ActiveConnection {
                     }
                 };
                 let routes = network::campus_routes(&server, &[protected])?;
+                for route in &routes {
+                    owned
+                        .add(OwnedRoute {
+                            network: *route,
+                            interface: "utun-test".into(),
+                            gateway: None,
+                        })
+                        .await?;
+                }
                 let ready = ConnectionInfo {
                     interface: "utun-test".into(),
                     address: server.address,
@@ -170,7 +196,8 @@ impl ActiveConnection {
     async fn stop(&mut self) -> Result<()> {
         match self {
             Self::Native(connection) => connection.stop().await,
-            Self::Offline { info, .. } => {
+            Self::Offline { info, routes, .. } => {
+                routes.cleanup().await?;
                 *info = None;
                 Ok(())
             }

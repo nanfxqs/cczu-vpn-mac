@@ -1,7 +1,9 @@
 //! Shared IPv4 rules used by platform route adapters.
 use anyhow::{Context, Result, bail, ensure};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct Ipv4Route {
     pub destination: std::net::Ipv4Addr,
     pub netmask: std::net::Ipv4Addr,
