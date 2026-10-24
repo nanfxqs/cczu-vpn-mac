@@ -20,6 +20,7 @@ use super::{
     connection::{ConnectionInfo, ConnectionManager, TestScenario},
     control::ConnectionControl,
     credentials::{self, CredentialStore, Credentials},
+    doctor,
 };
 
 const MAX_MESSAGE: u64 = 64 * 1024;
@@ -28,6 +29,12 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    Doctor {
+        #[serde(default)]
+        domains: Vec<String>,
+        #[serde(default)]
+        dns_override: bool,
+    },
     Connect {
         credentials: Option<Credentials>,
         #[serde(default)]
@@ -56,6 +63,7 @@ pub struct Status {
 }
 
 pub struct DaemonState {
+    pub test_mode: bool,
     pub status: Arc<Mutex<Status>>,
     pub credentials: Mutex<CredentialStore>,
     pub connection: ConnectionControl,
@@ -71,6 +79,7 @@ impl DaemonState {
             connection_info: None,
         }));
         Self {
+            test_mode: scenario.is_some(),
             credentials: Mutex::new(CredentialStore::new(directory.clone())),
             connection: ConnectionControl::new(
                 ConnectionManager::new(scenario, directory),
@@ -88,7 +97,10 @@ pub fn effective_uid() -> u32 {
 }
 
 pub async fn request(socket: &Path, request: &Request) -> Response {
-    let response_timeout = if matches!(request, Request::Connect { .. } | Request::Disconnect) {
+    let response_timeout = if matches!(
+        request,
+        Request::Connect { .. } | Request::Disconnect | Request::Doctor { .. }
+    ) {
         Duration::from_secs(100)
     } else {
         CONTROL_TIMEOUT
@@ -137,6 +149,18 @@ async fn serve_client(stream: UnixStream, state: Arc<DaemonState>) -> Result<()>
         Response::error("invalid_arguments", "Invalid or oversized control request")
     } else {
         match serde_json::from_slice::<Request>(&line) {
+            Ok(Request::Doctor {
+                domains,
+                dns_override,
+            }) => {
+                let status = state.status.lock().await.clone();
+                if dns_override {
+                    doctor::override_response(&status, &domains)
+                } else {
+                    let credentials = state.credentials.lock().await.status(false);
+                    doctor::run(status, credentials, state.test_mode, domains).await
+                }
+            }
             Ok(Request::Connect {
                 credentials,
                 ignore_saved,

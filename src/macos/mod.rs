@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 pub mod connection;
 pub mod control;
 pub mod credentials;
+pub mod doctor;
 mod install;
 pub mod network;
 pub mod service;
@@ -30,6 +31,15 @@ pub struct Args {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Inspect service, routing, DNS and the known campus HTTP resource.
+    Doctor {
+        /// Generate a one-time mihomo DNS fragment from the active native session.
+        #[arg(long)]
+        dns_override: bool,
+        /// Optionally check exact campus hostnames, without changing DNS settings.
+        #[arg(long = "domain")]
+        domains: Vec<String>,
+    },
     /// Establish a campus VPN and wait until its network configuration is ready.
     Connect {
         #[arg(long)]
@@ -161,6 +171,24 @@ pub async fn run() -> i32 {
         }
     };
     let response = match args.command {
+        Command::Doctor {
+            domains,
+            dns_override,
+        } => {
+            let response = service::request(
+                &args.socket,
+                &service::Request::Doctor {
+                    domains,
+                    dns_override,
+                },
+            )
+            .await;
+            if response.code == "service_unavailable" {
+                doctor::unavailable(response)
+            } else {
+                response
+            }
+        }
         Command::Connect {
             stdin,
             ignore_saved,
@@ -247,6 +275,12 @@ fn print_response(response: &Response, json_mode: bool) -> i32 {
         );
     } else {
         eprintln!("{}: {}", response.code, response.message);
+        if !response.data.is_null() {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response.data).expect("serializable response")
+            );
+        }
     }
     response.exit_code()
 }
