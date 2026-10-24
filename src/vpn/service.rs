@@ -73,6 +73,30 @@ struct StartingHandle {
     cancel: StartCancelSignal,
 }
 
+/// Dropping a timed-out/cancelled startup must not leave SESSION stuck in Starting.
+struct StartLease {
+    id: u64,
+    cancel: StartCancelSignal,
+    published: bool,
+}
+
+impl Drop for StartLease {
+    fn drop(&mut self) {
+        if !self.published {
+            self.cancel.store(true, Ordering::Relaxed);
+            clear_session_if_matches(self.id);
+        }
+    }
+}
+
+/// A caller cancelling shutdown must not detach an actor holding a live socket.
+struct AbortOnDropTask<T>(TokioJoinHandle<T>);
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 struct SessionHandle {
     id: u64,
     server: ProxyServer,
@@ -311,6 +335,11 @@ pub async fn start_service_with_options(
             cancel: cancel.clone(),
         }));
     }
+    let mut lease = StartLease {
+        id: session_id,
+        cancel: cancel.clone(),
+        published: false,
+    };
 
     let start_result = async {
         let user: String = user.into();
@@ -399,6 +428,11 @@ pub async fn start_service_with_options(
     let mut guard = lock_session()?;
     match start_result {
         Ok(handle) => {
+            let owns_start = matches!(guard.as_ref(),Some(SessionSlot::Starting(start)) if start.id==session_id && !start.cancel.load(Ordering::Relaxed));
+            if !owns_start || cancel.load(Ordering::Relaxed) || handle.task.is_finished() {
+                handle.task.abort();
+                bail!("proxy service startup was cancelled or tunnel closed before publication");
+            }
             info!(
                 session_id = handle.id,
                 address = %handle.server.address,
@@ -408,6 +442,7 @@ pub async fn start_service_with_options(
                 "proxy service started"
             );
             guard.replace(SessionSlot::Running(handle));
+            lease.published = true;
             Ok(())
         }
         Err(err) => {
@@ -450,17 +485,17 @@ pub async fn stop_service() -> Result<()> {
 
     match session {
         Some(SessionSlot::Running(handle)) => {
-            let mut task = handle.task;
+            let mut task = AbortOnDropTask(handle.task);
             let _ = time::timeout(
                 Duration::from_secs(2),
                 handle.command_tx.send(SessionCommand::Stop),
             )
             .await;
-            match time::timeout(Duration::from_secs(2), &mut task).await {
+            match time::timeout(Duration::from_secs(2), &mut task.0).await {
                 Ok(result) => result.context("session actor task join failed")??,
                 Err(_) => {
-                    task.abort();
-                    let _ = task.await;
+                    task.0.abort();
+                    let _ = (&mut task.0).await;
                     bail!("VPN session shutdown timed out; actor was aborted");
                 }
             }
