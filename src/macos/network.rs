@@ -173,7 +173,11 @@ pub fn campus_routes(server: &ProxyServer, protected: &[Ipv4Route]) -> Result<Ve
     );
     let mut routes = Vec::new();
     for rule in &server.split_tunnel_routes {
-        if let Some(route) = parse_split_tunnel_route(rule)? {
+        // Server rule text is untrusted and may contain arbitrary data. Retain
+        // the validation category without echoing the raw protocol field.
+        if let Some(route) = parse_split_tunnel_route(rule)
+            .map_err(|_| anyhow::anyhow!("Invalid server campus route syntax"))?
+        {
             let prefix = netmask_to_prefix(route.netmask)?;
             ensure!(
                 prefix >= 8 && usable(route.destination),

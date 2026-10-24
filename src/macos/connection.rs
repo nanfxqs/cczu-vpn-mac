@@ -26,6 +26,7 @@ pub enum TestScenario {
     Disabled,
     Ready,
     SetupFailure,
+    NetworkDetail,
     UnsafeDefault,
     LocalOverlap,
     InvalidMask,
@@ -193,6 +194,12 @@ impl ActiveConnection {
                 })
                 .await;
 
+                if matches!(scenario, TestScenario::NetworkDetail) {
+                    return Err(classify_startup_error(network_error(
+                        "campus route installation",
+                        anyhow::anyhow!("Network is unreachable (os error 51)"),
+                    )));
+                }
                 let failure = match scenario {
                     TestScenario::AuthRejected => Some(StartupFailure::AuthenticationRejected),
                     TestScenario::AuthTransport => Some(StartupFailure::AuthenticationTransport),
@@ -203,7 +210,7 @@ impl ActiveConnection {
                     _ => None,
                 };
                 if let Some(failure) = failure {
-                    return Err(failure.into());
+                    return Err(classify_startup_error(failure.into()));
                 }
                 let mut server = offline_server();
                 match scenario {
@@ -290,6 +297,40 @@ fn offline_server() -> ProxyServer {
     }
 }
 
+// Only explicitly marked network operations may expose their cause chain. Never
+// use this adapter around authentication, TLS, or tunnel protocol operations.
+#[derive(Debug)]
+pub(super) struct NetworkDetail(String);
+impl std::fmt::Display for NetworkDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for NetworkDetail {}
+
+fn network_error(stage: &'static str, error: anyhow::Error) -> anyhow::Error {
+    if error.downcast_ref::<StartupFailure>().is_some() {
+        return classify_startup_error(error);
+    }
+    let detail = NetworkDetail(format!(
+        "{}: {stage}: {error:#}",
+        StartupFailure::NetworkConfiguration
+    ));
+    anyhow::Error::new(detail).context(StartupFailure::NetworkConfiguration)
+}
+
+fn classify_startup_error(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast_ref::<StartupFailure>().copied() {
+        Some(StartupFailure::NetworkConfiguration)
+            if error.downcast_ref::<NetworkDetail>().is_some() =>
+        {
+            error
+        }
+        Some(failure) => failure.into(),
+        None => StartupFailure::NetworkConfiguration.into(),
+    }
+}
+
 #[derive(Default)]
 struct NativeConnection {
     info: Option<ConnectionInfo>,
@@ -300,42 +341,52 @@ struct NativeConnection {
 
 impl NativeConnection {
     async fn start(&mut self, credentials: Credentials) -> Result<ConnectionInfo> {
-        self.start_inner(credentials).await.map_err(|error| {
-            error
-                .downcast_ref::<StartupFailure>()
-                .copied()
-                .unwrap_or(StartupFailure::NetworkConfiguration)
-                .into()
-        })
+        self.start_inner(credentials)
+            .await
+            .map_err(classify_startup_error)
     }
+
     async fn start_inner(&mut self, credentials: Credentials) -> Result<ConnectionInfo> {
         let deadline = Instant::now() + Duration::from_secs(60);
-        let default = network::lookup("default")
-            .await?
-            .context("No default physical route")?;
-        ensure!(
-            default.physical(),
-            "Default route belongs to another tunnel; cannot infer a safe physical path"
-        );
-        let mut protected = network::local_networks(&default.interface).await?;
-        if let Some(gateway) = default.gateway {
-            let gateway_route = network::lookup(&gateway.to_string())
-                .await?
-                .context("No physical route to the default gateway")?;
+        let (default, protected, endpoints) = async {
+            let default = network::lookup("default")
+                .await
+                .map_err(|error| network_error("local route preflight", error))?
+                .context("No default physical route")
+                .map_err(|error| network_error("local route preflight", error))?;
             ensure!(
-                gateway_route.physical(),
-                "Default gateway is routed through another tunnel"
+                default.physical(),
+                "Default route belongs to another tunnel; cannot infer a safe physical path"
             );
-            protected.push(
-                gateway_route.network.context(
+            let mut protected = network::local_networks(&default.interface)
+                .await
+                .map_err(|error| network_error("local subnet preflight", error))?;
+            if let Some(gateway) = default.gateway {
+                let gateway_route = network::lookup(&gateway.to_string())
+                    .await
+                    .map_err(|error| network_error("default gateway preflight", error))?
+                    .context("No physical route to the default gateway")
+                    .map_err(|error| network_error("default gateway preflight", error))?;
+                ensure!(
+                    gateway_route.physical(),
+                    "Default gateway is routed through another tunnel"
+                );
+                protected.push(gateway_route.network.context(
                     "Cannot prove a specific physical route protects the default gateway",
-                )?,
-            );
+                )?);
+            }
+            let endpoints = network::endpoint_addresses()
+                .await
+                .map_err(|error| network_error("endpoint DNS preflight", error))?;
+            Ok::<_, anyhow::Error>((default, protected, endpoints))
         }
-        let endpoints = network::endpoint_addresses().await?;
+        .await
+        .map_err(|error| network_error("local network preflight", error))?;
         for endpoint in &endpoints {
             ensure!(Instant::now() < deadline, "VPN bootstrap deadline expired");
-            network::protect_endpoint(&mut self.routes, *endpoint, &default).await?;
+            network::protect_endpoint(&mut self.routes, *endpoint, &default)
+                .await
+                .map_err(|error| network_error("endpoint route protection", error))?;
         }
 
         let startup = tokio::time::timeout_at(
@@ -366,9 +417,12 @@ impl NativeConnection {
             _ => bail!("IPv6 tunnel peers are outside the current IPv4 support scope"),
         };
         if !endpoints.contains(&peer) {
-            network::protect_endpoint(&mut self.routes, peer, &default).await?;
+            network::protect_endpoint(&mut self.routes, peer, &default)
+                .await
+                .map_err(|error| network_error("peer route protection", error))?;
         }
-        let campus = network::campus_routes(&server, &protected)?;
+        let campus = network::campus_routes(&server, &protected)
+            .map_err(|error| network_error("server route validation", error))?;
         ensure!(
             Instant::now() < deadline,
             "VPN network setup deadline expired"
@@ -381,14 +435,22 @@ impl NativeConnection {
                 Some(server.gateway.as_str()),
             )
             .build_sync()
-            .context("Could not create/configure macOS utun")?;
-        let interface = device.name()?;
+            .context("Could not create/configure macOS utun")
+            .map_err(|error| network_error("utun configuration", error))?;
+        let interface = device
+            .name()
+            .map_err(|error| network_error("utun name lookup", error.into()))?;
         ensure!(
             interface.starts_with("utun"),
             "Expected a new macOS utun interface"
         );
-        device.set_nonblocking(true)?;
-        self.device = Some(Arc::new(AsyncFd::new(device)?));
+        device
+            .set_nonblocking(true)
+            .map_err(|error| network_error("utun nonblocking setup", error.into()))?;
+        self.device =
+            Some(Arc::new(AsyncFd::new(device).map_err(|error| {
+                network_error("utun readiness setup", error.into())
+            })?));
         for route in &campus {
             ensure!(
                 Instant::now() < deadline,
@@ -400,7 +462,8 @@ impl NativeConnection {
                     interface: interface.clone(),
                     gateway: None,
                 })
-                .await?;
+                .await
+                .map_err(|error| network_error("campus route installation", error))?;
         }
         ensure!(
             service::service_available().await,

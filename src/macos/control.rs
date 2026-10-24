@@ -247,6 +247,13 @@ async fn start(
                     "VPN connection startup timed out".into(),
                 ),
                 StartResult::Finished(Err(error)) => match error.downcast_ref::<StartupFailure>() {
+                    Some(StartupFailure::NetworkConfiguration) => (
+                        "network_configuration_failed",
+                        error
+                            .downcast_ref::<super::connection::NetworkDetail>()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| StartupFailure::NetworkConfiguration.to_string()),
+                    ),
                     Some(failure) => (failure.code(), failure.to_string()),
                     None => ("network_configuration_failed", error.to_string()),
                 },

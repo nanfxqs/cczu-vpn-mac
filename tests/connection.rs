@@ -208,6 +208,30 @@ fn failed_setup_rolls_back_and_temporary_credentials_do_not_persist() {
 }
 
 #[test]
+fn network_failure_reports_stage_and_cause_in_connect_and_status() {
+    let fixture = Fixture::start("network-detail");
+    let (exit, failed) = fixture.call(
+        &["connect", "--stdin", "--ignore-saved"],
+        Some(json!({"user":"campus", "password":"network-secret-canary"})),
+    );
+    assert_eq!(exit, 5);
+    assert_eq!(failed["code"], "network_configuration_failed");
+    let message = failed["message"].as_str().unwrap();
+    assert!(message.contains("campus route installation"), "{failed}");
+    assert!(
+        message.contains("Network is unreachable (os error 51)"),
+        "{failed}"
+    );
+    let status = fixture.call(&["status"], None).1;
+    assert_eq!(status["data"]["last_error"], message);
+    assert_eq!(
+        status["data"]["last_error_code"],
+        "network_configuration_failed"
+    );
+    assert!(!format!("{failed}{status}").contains("network-secret-canary"));
+}
+
+#[test]
 fn unsafe_server_routes_fail_before_publishing_connected_state() {
     for scenario in ["unsafe-default", "local-overlap", "invalid-mask"] {
         let fixture = Fixture::start(scenario);
