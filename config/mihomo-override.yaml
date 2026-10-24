@@ -1,0 +1,5 @@
+# 合并到 mihomo 全局覆写的对应列表，保留已有条目；本文件不会自动加载。
+dns:
+  fake-ip-filter:
+    # cczu
+    - '+.cczu.edu.cn'
