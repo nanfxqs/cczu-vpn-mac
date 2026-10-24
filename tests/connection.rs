@@ -267,6 +267,42 @@ fn broader_campus_route_preserves_a_more_specific_local_network() {
 }
 
 #[test]
+fn advertised_endpoint_hosts_keep_physical_guards_and_campus_access() {
+    let fixture = Fixture::start("endpoint-overlap");
+    let (exit, ready) = fixture.call(
+        &["connect", "--stdin"],
+        Some(json!({"user":"campus", "password":"endpoint-secret-canary"})),
+    );
+    assert_eq!(exit, 0, "{ready}");
+    let routes = ready["data"]["connection_info"]["routes"]
+        .as_array()
+        .unwrap();
+    assert!(routes.contains(&json!("172.22.0.0/16")));
+    assert!(routes.contains(&json!("211.65.64.0/22")));
+    for endpoint in ["211.65.64.100", "211.65.66.99", "211.65.66.101"] {
+        assert!(!routes.contains(&json!(format!("{endpoint}/32"))));
+    }
+    // The external offline route backend records the same add/delete operations
+    // as the native adapter, including endpoint guards created before campus adds.
+    let table_path = fixture.directory.join("data/offline-routes.json");
+    let table: Value = serde_json::from_slice(&fs::read(&table_path).unwrap()).unwrap();
+    let direct: Vec<_> = table
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["interface"] == "en-test")
+        .collect();
+    assert_eq!(direct.len(), 3);
+    for entry in direct {
+        assert_eq!(entry["gateway"], "192.0.2.1");
+        assert_eq!(entry["network"]["netmask"], "255.255.255.255");
+    }
+    assert_eq!(fixture.call(&["disconnect"], None).0, 0);
+    let table: Value = serde_json::from_slice(&fs::read(table_path).unwrap()).unwrap();
+    assert_eq!(table, json!([]));
+}
+
+#[test]
 fn disconnect_cancels_all_waiters_and_startup_cannot_publish_late_success() {
     let fixture = Fixture::start("slow-ready");
     fixture.credentials();

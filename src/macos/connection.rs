@@ -27,6 +27,7 @@ pub enum TestScenario {
     Ready,
     SetupFailure,
     NetworkDetail,
+    EndpointOverlap,
     UnsafeDefault,
     LocalOverlap,
     InvalidMask,
@@ -228,6 +229,31 @@ impl ActiveConnection {
                     }
                     _ => {}
                 }
+                let reserved = if matches!(scenario, TestScenario::EndpointOverlap) {
+                    let reserved = vec![
+                        Ipv4Addr::new(211, 65, 64, 100),
+                        Ipv4Addr::new(211, 65, 66, 99),
+                        Ipv4Addr::new(211, 65, 66, 101),
+                    ];
+                    for endpoint in &reserved {
+                        owned
+                            .add(OwnedRoute {
+                                network: cczuvpnproto::routes::Ipv4Route {
+                                    destination: *endpoint,
+                                    netmask: Ipv4Addr::BROADCAST,
+                                },
+                                interface: "en-test".into(),
+                                gateway: Some(Ipv4Addr::new(192, 0, 2, 1)),
+                            })
+                            .await?;
+                        server.split_tunnel_routes.push(format!("{endpoint}/32"));
+                    }
+                    server.split_tunnel_routes.push("211.65.64.0/22".into());
+                    server.dns = reserved[1].to_string();
+                    reserved
+                } else {
+                    Vec::new()
+                };
                 let protected = if matches!(scenario, TestScenario::BroadCampus) {
                     cczuvpnproto::routes::Ipv4Route {
                         destination: Ipv4Addr::new(172, 28, 32, 0),
@@ -239,7 +265,7 @@ impl ActiveConnection {
                         netmask: Ipv4Addr::new(255, 255, 255, 0),
                     }
                 };
-                let routes = network::campus_routes(&server, &[protected])?;
+                let routes = network::campus_routes(&server, &[protected], &reserved)?;
                 for route in &routes {
                     owned
                         .add(OwnedRoute {
@@ -255,7 +281,12 @@ impl ActiveConnection {
                     mask: server.mask,
                     gateway: server.gateway,
                     dns: server.dns,
-                    peer: "211.65.64.100".into(),
+                    peer: if matches!(scenario, TestScenario::EndpointOverlap) {
+                        "211.65.66.101"
+                    } else {
+                        "211.65.64.100"
+                    }
+                    .into(),
                     routes: routes
                         .into_iter()
                         .map(network::cidr)
@@ -421,7 +452,9 @@ impl NativeConnection {
                 .await
                 .map_err(|error| network_error("peer route protection", error))?;
         }
-        let campus = network::campus_routes(&server, &protected)
+        let mut physical_endpoints = endpoints;
+        physical_endpoints.push(peer);
+        let campus = network::campus_routes(&server, &protected, &physical_endpoints)
             .map_err(|error| network_error("server route validation", error))?;
         ensure!(
             Instant::now() < deadline,

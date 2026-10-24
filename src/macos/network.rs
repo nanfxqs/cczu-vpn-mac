@@ -151,7 +151,11 @@ fn usable(address: Ipv4Addr) -> bool {
         && !address.is_link_local()
 }
 
-pub fn campus_routes(server: &ProxyServer, protected: &[Ipv4Route]) -> Result<Vec<Ipv4Route>> {
+pub fn campus_routes(
+    server: &ProxyServer,
+    protected: &[Ipv4Route],
+    physical_endpoints: &[Ipv4Addr],
+) -> Result<Vec<Ipv4Route>> {
     let address: Ipv4Addr = server
         .address
         .parse()
@@ -216,6 +220,12 @@ pub fn campus_routes(server: &ProxyServer, protected: &[Ipv4Route]) -> Result<Ve
             });
         }
     }
+    // Control endpoints must keep their physical /32 guards even when the
+    // server advertises them as campus hosts or DNS. Wider campus prefixes
+    // remain useful: the existing physical host route wins longest-prefix lookup.
+    routes.retain(|route| {
+        route.netmask != Ipv4Addr::BROADCAST || !physical_endpoints.contains(&route.destination)
+    });
     routes.sort();
     routes.dedup();
     ensure!(
