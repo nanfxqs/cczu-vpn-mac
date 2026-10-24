@@ -469,7 +469,10 @@ impl RouteSet {
     fn is_owned(&self, route: &OwnedRoute, current: &RouteSnapshot) -> bool {
         route.matches(current)
             && current.marked
-            && (!self.offline || current.owner.as_deref() == Some(&self.owner))
+            && current
+                .owner
+                .as_deref()
+                .is_none_or(|owner| owner == self.owner)
     }
 
     async fn mutate(&self, route: &OwnedRoute, action: &str) -> Result<()> {
@@ -554,15 +557,18 @@ impl RouteSet {
                             self.same_boot,
                             "Route journal belongs to another boot; matching route left untouched"
                         );
+                        // The write-ahead record was persisted only after exact-route
+                        // absence. Same boot + exact prefix/interface/gateway + PROTO2
+                        // is sufficient attribution for physical endpoint routes even
+                        // if the confirmation write was interrupted. Pending is an
+                        // intent to reconcile, not a permanent cleanup prohibition.
+                        // Recovered native utun names can be reused; only a backend
+                        // with a durable resource owner token can prove that identity.
                         ensure!(
-                            self.offline || !self.pending.contains(&route.network),
-                            "Uncertain route mutation {}; ownership not confirmed, left untouched",
-                            cidr(route.network)?
-                        );
-                        // utun names can be reused after death. A recovered journal does
-                        // not own an open fd, so never infer live interface ownership.
-                        ensure!(
-                            !self.recovered || self.offline || !route.interface.starts_with("utun"),
+                            !self.recovered
+                                || (current.physical()
+                                    && route.network.netmask == Ipv4Addr::BROADCAST)
+                                || current.owner.as_deref() == Some(&self.owner),
                             "Cannot prove recovered utun ownership; route {} left untouched",
                             cidr(route.network)?
                         );

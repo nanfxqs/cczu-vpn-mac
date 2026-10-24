@@ -1,10 +1,11 @@
 use std::{collections::HashMap, future::Future, time::Duration};
 
+use crate::failure::StartupFailure;
 use aes::{
     Aes128Enc,
     cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use base64::{Engine, prelude::BASE64_STANDARD};
 use cbc::Encryptor;
 use cczuni::base::client::Client;
@@ -59,19 +60,24 @@ async fn webvpn_login(client: &DefaultClient) -> Result<ElinkLoginInfo> {
         .form(&form)
         .send()
         .await
-        .context("failed to send WebVPN login request")?;
+        .map_err(|_| StartupFailure::AuthenticationTransport)?;
 
     if !response.status().is_redirection() {
-        bail!("WebVPN login failed with status: {}", response.status());
+        return Err(if matches!(response.status().as_u16(), 401 | 403) {
+            StartupFailure::AuthenticationRejected
+        } else {
+            StartupFailure::AuthenticationResponse
+        }
+        .into());
     }
     let client_info = response
         .cookies()
         .find(|cookie| cookie.name() == "clientInfo")
-        .context("WebVPN login response did not contain clientInfo")?;
+        .ok_or(StartupFailure::AuthenticationResponse)?;
     let decoded = BASE64_STANDARD
         .decode(client_info.value())
-        .context("failed to decode WebVPN clientInfo")?;
-    serde_json::from_slice(&decoded).context("failed to parse WebVPN clientInfo")
+        .map_err(|_| StartupFailure::AuthenticationResponse)?;
+    serde_json::from_slice(&decoded).map_err(|_| StartupFailure::AuthenticationResponse.into())
 }
 
 pub async fn authorize(
@@ -81,9 +87,19 @@ pub async fn authorize(
     run_with_timeout(Duration::from_secs(30), async {
         let client = DefaultClient::account(user, password);
         let info = webvpn_login(&client).await?;
-        client.webvpn_get_proxy_service(info.userid).await
+        client
+            .webvpn_get_proxy_service(info.userid)
+            .await
+            .map_err(|error| {
+                if error.is::<serde_json::Error>() {
+                    StartupFailure::AuthenticationResponse.into()
+                } else {
+                    StartupFailure::AuthenticationTransport.into()
+                }
+            })
     })
-    .await?
+    .await
+    .map_err(|_| StartupFailure::Timeout)?
 }
 
 async fn run_with_timeout<T>(duration: Duration, operation: impl Future<Output = T>) -> Result<T> {

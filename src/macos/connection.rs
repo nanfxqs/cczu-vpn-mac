@@ -1,7 +1,7 @@
 use super::credentials::Credentials;
 use super::network::{self, OwnedRoute, RouteSet};
 use anyhow::{Context, Result, bail, ensure};
-use cczuvpnproto::{types::ProxyServer, vpn::service};
+use cczuvpnproto::{failure::StartupFailure, types::ProxyServer, vpn::service};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -15,6 +15,11 @@ use tun_rs::{DeviceBuilder, SyncDevice};
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum TestScenario {
+    AuthRejected,
+    AuthTransport,
+    AuthResponse,
+    TlsFailure,
+    TunnelFailure,
     SlowReady,
     StartupTimeout,
     ForwardFailure,
@@ -95,7 +100,7 @@ impl ConnectionManager {
             Ok(info) => Ok(info),
             Err(error) => {
                 if let Err(cleanup) = self.disconnect().await {
-                    bail!("{error}; cleanup requires retry: {cleanup}");
+                    return Err(error.context(format!("Cleanup requires retry: {cleanup}")));
                 }
                 Err(error)
             }
@@ -188,10 +193,18 @@ impl ActiveConnection {
                 })
                 .await;
 
-                ensure!(
-                    !matches!(scenario, TestScenario::SetupFailure),
-                    "Offline backend injected a network setup failure"
-                );
+                let failure = match scenario {
+                    TestScenario::AuthRejected => Some(StartupFailure::AuthenticationRejected),
+                    TestScenario::AuthTransport => Some(StartupFailure::AuthenticationTransport),
+                    TestScenario::AuthResponse => Some(StartupFailure::AuthenticationResponse),
+                    TestScenario::TlsFailure => Some(StartupFailure::Tls),
+                    TestScenario::TunnelFailure => Some(StartupFailure::TunnelNegotiation),
+                    TestScenario::SetupFailure => Some(StartupFailure::NetworkConfiguration),
+                    _ => None,
+                };
+                if let Some(failure) = failure {
+                    return Err(failure.into());
+                }
                 let mut server = offline_server();
                 match scenario {
                     TestScenario::UnsafeDefault => {
@@ -287,6 +300,15 @@ struct NativeConnection {
 
 impl NativeConnection {
     async fn start(&mut self, credentials: Credentials) -> Result<ConnectionInfo> {
+        self.start_inner(credentials).await.map_err(|error| {
+            error
+                .downcast_ref::<StartupFailure>()
+                .copied()
+                .unwrap_or(StartupFailure::NetworkConfiguration)
+                .into()
+        })
+    }
+    async fn start_inner(&mut self, credentials: Credentials) -> Result<ConnectionInfo> {
         let deadline = Instant::now() + Duration::from_secs(60);
         let default = network::lookup("default")
             .await?
@@ -323,10 +345,14 @@ impl NativeConnection {
         .await;
         match startup {
             Ok(Ok(())) => {}
-            Ok(Err(_)) => bail!(
-                "VPN authentication or tunnel startup failed; verify campus credentials and gateway reachability"
-            ),
-            Err(_) => bail!("VPN authentication/tunnel startup timed out"),
+            Ok(Err(error)) => {
+                return Err(error
+                    .downcast_ref::<StartupFailure>()
+                    .copied()
+                    .unwrap_or(StartupFailure::TunnelNegotiation)
+                    .into());
+            }
+            Err(_) => return Err(StartupFailure::Timeout.into()),
         }
         ensure!(
             service::service_available().await,

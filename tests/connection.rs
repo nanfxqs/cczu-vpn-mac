@@ -194,7 +194,7 @@ fn failed_setup_rolls_back_and_temporary_credentials_do_not_persist() {
         Some(json!({"user":"campus", "password":"temporary-secret"})),
     );
     assert_eq!(code, 5);
-    assert_eq!(failed["code"], "connection_failed");
+    assert_eq!(failed["code"], "network_configuration_failed");
     let status = fixture.call(&["status"], None).1;
     assert_eq!(status["data"]["connection"], "failed");
     assert_eq!(status["data"]["connection_info"], Value::Null);
@@ -216,7 +216,7 @@ fn unsafe_server_routes_fail_before_publishing_connected_state() {
             Some(json!({"user":"campus", "password":"not-logged"})),
         );
         assert_eq!(code, 5);
-        assert_eq!(failed["code"], "connection_failed");
+        assert_eq!(failed["code"], "network_configuration_failed");
         assert_eq!(
             fixture.call(&["status"], None).1["data"]["connection"],
             "failed"
@@ -343,4 +343,33 @@ fn forwarding_failure_is_cleaned_without_polling_and_does_not_auto_reconnect() {
         failed["data"]["last_error"]
     );
     assert_eq!(fixture.call(&["connect"], None).1["data"]["generation"], 2);
+}
+
+#[test]
+fn startup_failures_keep_sanitized_categories_in_cli_and_status() {
+    for (scenario, expected) in [
+        ("auth-rejected", "authentication_rejected"),
+        ("auth-transport", "authentication_transport"),
+        ("auth-response", "authentication_response"),
+        ("tls-failure", "tls_failed"),
+        ("tunnel-failure", "tunnel_negotiation_failed"),
+        ("setup-failure", "network_configuration_failed"),
+    ] {
+        let fixture = Fixture::start(scenario);
+        let (code, response) = fixture.call(
+            &["connect", "--stdin"],
+            Some(json!({"user":"campus", "password":"secret-canary-928"})),
+        );
+        assert_eq!(code, 5, "{response}");
+        assert_eq!(response["code"], expected, "{scenario}: {response}");
+        let status = fixture.wait_for("failed");
+        assert_eq!(status["data"]["last_error_code"], expected);
+        assert!(
+            status["data"]["last_error"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty())
+        );
+        assert!(!format!("{response}{status}").contains("secret-canary-928"));
+        assert_eq!(fixture.call(&["disconnect"], None).0, 0);
+    }
 }

@@ -123,3 +123,24 @@ The daemon persists a private route intent journal at `/var/db/cczu-vpn/network-
 Existing routes are never adopted. Changed routes are retained and reported as an incomplete recovery; new connections remain blocked until cleanup can finish. Native mutations interrupted before confirmation, routes attributed to another boot, and a surviving recovered utun whose ownership cannot be proven remain untouched. An old utun name alone is insufficient because macOS can reuse it. Missing routes are reconciled without deleting another prefix. The offline backend exercises this same journal and cleanup algorithm using an isolated persisted route table; its owner token models provable resource identity and does not claim a native macOS interface has that token.
 
 Installation records the identity of its executable in `/var/db/cczu-vpn/install.json`; install/uninstall refuse to overwrite or delete a replaced executable or changed service definition. Stop, reinstall and uninstall also reconcile owned network resources after the service exits. Uninstall retains saved campus credentials by default. To remove them, run `cczu-vpn-proto --json credentials delete` while the service is running before uninstalling. Neither cleanup nor removal changes mihomo configuration.
+
+Startup failures expose a stable category in the response `code` and in status
+`last_error_code`, alongside the sanitized human-readable `last_error`. Categories
+include `credentials_required`, `authentication_rejected`,
+`authentication_transport`, `authentication_response`, `tls_failed`,
+`tunnel_transport_failed`, `tunnel_negotiation_failed`,
+`network_configuration_failed`, and `connection_timeout`. These failures use exit
+code `5`. `authentication_rejected` means the login endpoint returned HTTP 401 or
+403; it does not establish that the password was wrong. Other unusable login
+responses are `authentication_response`. Upstream bodies and error chains are not
+included in startup diagnostics. Successful connect clears the previous failure.
+
+Route recovery reconciles the write-ahead journal even if the process died after
+kernel add but before its confirmation write. A physical endpoint host route can
+be cleaned when the journal recorded its prior absence in the same boot and the
+current exact prefix, interface, gateway and PROTO2 marker match. Changed or
+unmarked routes are preserved. Recovered native utun names cannot prove ownership
+because macOS may reuse them; matching routes on such interfaces remain untouched
+until they disappear. Retrying disconnect then completes cleanup. Offline tests
+exercise this same decision with native-shaped snapshots without an owner token;
+the offline backend also has a durable token for its simulated tunnel identity.

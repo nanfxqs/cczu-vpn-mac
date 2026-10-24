@@ -53,12 +53,23 @@ pub enum Request {
     CredentialsDelete,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionPhase {
+    Disconnected,
+    Connecting,
+    Connected,
+    Disconnecting,
+    Failed,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Status {
     pub generation: u64,
     pub service: String,
-    pub connection: String,
+    pub connection: ConnectionPhase,
     pub last_error: Option<String>,
+    pub last_error_code: Option<String>,
     pub connection_info: Option<ConnectionInfo>,
 }
 
@@ -74,8 +85,9 @@ impl DaemonState {
         let status = Arc::new(Mutex::new(Status {
             generation: 0,
             service: "running".into(),
-            connection: "disconnected".into(),
+            connection: ConnectionPhase::Disconnected,
             last_error: None,
+            last_error_code: None,
             connection_info: None,
         }));
         Self {
@@ -169,8 +181,11 @@ async fn serve_client(stream: UnixStream, state: Arc<DaemonState>) -> Result<()>
                 credentials,
                 ignore_saved,
             }) => {
-                let phase = state.status.lock().await.connection.clone();
-                if matches!(phase.as_str(), "connected" | "connecting") {
+                let phase = state.status.lock().await.connection;
+                if matches!(
+                    phase,
+                    ConnectionPhase::Connected | ConnectionPhase::Connecting
+                ) {
                     state.connection.connect(None).await
                 } else {
                     let resolved = state

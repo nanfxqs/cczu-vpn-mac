@@ -21,6 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     auth::authorize,
+    failure::StartupFailure,
     types::{ProxyServer, StartOptions},
 };
 
@@ -354,7 +355,7 @@ pub async fn start_service_with_options(
             .gateway_list
             .first()
             .map(|gateway| gateway.dns.clone())
-            .context("authorization response does not contain gateway dns")?;
+            .ok_or(StartupFailure::AuthenticationResponse)?;
         let split_tunnel_routes = collect_split_tunnel_routes(&authorization.data);
 
         let config = build_client_config(options.no_verification);
@@ -363,7 +364,7 @@ pub async fn start_service_with_options(
         let connector = TlsConnector::from(config);
         let tcpstream = TcpStream::connect(addr)
             .await
-            .with_context(|| format!("failed to connect to proxy server at {addr}"))?;
+            .map_err(|_| StartupFailure::TunnelTransport)?;
         let peer = tcpstream
             .peer_addr()
             .context("failed to query proxy peer address")?;
@@ -382,16 +383,18 @@ pub async fn start_service_with_options(
         let mut io = connector
             .connect(server_name, tcpstream)
             .await
-            .context("failed to establish TLS with proxy server")?;
+            .map_err(|_| StartupFailure::Tls)?;
         check_start_cancelled(&cancel)?;
         let packet = AuthorizationPacket::new(authorization.data.token, user)
             .build()
-            .context("failed to build authorization packet")?;
+            .map_err(|_| StartupFailure::TunnelNegotiation)?;
         io.write_all(packet.as_slice())
             .await
-            .context("failed to send authorization packet")?;
+            .map_err(|_| StartupFailure::TunnelNegotiation)?;
 
-        let mut proxy = consume_authization(&mut io).await?;
+        let mut proxy = consume_authization(&mut io)
+            .await
+            .map_err(|_| StartupFailure::TunnelNegotiation)?;
         check_start_cancelled(&cancel)?;
         proxy.dns = realdns;
         proxy.split_tunnel_routes = split_tunnel_routes;

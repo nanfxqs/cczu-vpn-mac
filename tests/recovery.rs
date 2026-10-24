@@ -347,7 +347,22 @@ fn recovery_reconciles_write_ahead_intent_with_current_resource_ownership() {
     daemon.kill();
     let path = dir.join("data/network-journal.json");
     let mut journal: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    // The kernel mutation completed, but the process died before confirming it.
+    // Model the native physical endpoint route, which has no offline owner token.
+    // Kernel add succeeded before the confirmation write. This exercises native
+    // attribution, rather than the offline backend's stronger ownership evidence.
+    journal["routes"] = json!([journal["routes"][0].clone()]);
+    journal["routes"][0]["network"] =
+        json!({"destination":"211.65.64.100","netmask":"255.255.255.255"});
+    journal["routes"][0]["interface"] = json!("en0");
+    journal["routes"][0]["gateway"] = json!("192.0.2.1");
+    let table_path = dir.join("data/offline-routes.json");
+    let mut table: Value = serde_json::from_slice(&fs::read(&table_path).unwrap()).unwrap();
+    table = json!([table[0].clone()]);
+    table[0]["network"] = journal["routes"][0]["network"].clone();
+    table[0]["interface"] = json!("en0");
+    table[0]["gateway"] = json!("192.0.2.1");
+    table[0]["owner"] = Value::Null;
+    fs::write(&table_path, serde_json::to_vec(&table).unwrap()).unwrap();
     journal["pending"] = json!([journal["routes"][0]["network"].clone()]);
     fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
     let restarted = Daemon::start(dir.clone());
@@ -363,4 +378,48 @@ fn recovery_reconciles_write_ahead_intent_with_current_resource_ownership() {
     drop(restarted);
     drop(daemon);
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn native_attribution_preserves_reused_utun_unmarked_and_changed_routes() {
+    for conflict in ["reused-utun", "unmarked", "changed-gateway"] {
+        let dir = temp();
+        let mut daemon = Daemon::start(dir.clone());
+        daemon.connect();
+        daemon.kill();
+        let journal_path = dir.join("data/network-journal.json");
+        let table_path = dir.join("data/offline-routes.json");
+        let mut journal: Value = serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+        let network = json!({"destination":"211.65.64.100","netmask":"255.255.255.255"});
+        let interface = if conflict == "reused-utun" {
+            "utun8"
+        } else {
+            "en0"
+        };
+        journal["routes"] =
+            json!([{"network":network,"interface":interface,"gateway":"192.0.2.1"}]);
+        journal["pending"] = json!([network]);
+        let table = json!([{"network":network,"interface":interface,
+            "gateway":if conflict == "changed-gateway" {"192.0.2.2"} else {"192.0.2.1"},
+            "marked":conflict != "unmarked","owner":null}]);
+        fs::write(&journal_path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        fs::write(&table_path, serde_json::to_vec(&table).unwrap()).unwrap();
+        let restarted = Daemon::start(dir.clone());
+        assert_eq!(
+            call(&dir, &["status"], None).1["data"]["connection"],
+            "failed",
+            "{conflict}"
+        );
+        assert_ne!(call(&dir, &["disconnect"], None).0, 0);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&table_path).unwrap()).unwrap(),
+            table
+        );
+        // Once the foreign resource disappears, retry finishes without service recovery.
+        fs::write(&table_path, b"[]").unwrap();
+        assert_eq!(call(&dir, &["disconnect"], None).0, 0);
+        drop(restarted);
+        drop(daemon);
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

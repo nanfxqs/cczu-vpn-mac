@@ -1,5 +1,7 @@
 //! Own one connection independently of any individual CLI request.
+use super::service::ConnectionPhase;
 use super::{Response, connection::ConnectionManager, credentials::Credentials, service::Status};
+use cczuvpnproto::failure::StartupFailure;
 use std::{
     sync::{
         Arc,
@@ -26,8 +28,9 @@ impl ConnectionControl {
     pub async fn new(mut manager: ConnectionManager, status: Arc<Mutex<Status>>) -> Self {
         if let Err(error) = manager.recover().await {
             let mut snapshot = status.lock().await;
-            snapshot.connection = "failed".into();
+            snapshot.connection = ConnectionPhase::Failed;
             snapshot.last_error = Some(error.to_string());
+            snapshot.last_error_code = Some("cleanup_failed".into());
         }
         let (sender, receiver) = mpsc::channel(32);
         tokio::spawn(worker(manager, receiver, status));
@@ -96,8 +99,9 @@ async fn worker(
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     loop {
         let message = tokio::select! {message=receiver.recv()=>Some(message),_ = tick.tick()=>None};
-        if let Some(error) = manager.forwarding_error().await
-            && cleanup(
+        if let Some(error) = manager.forwarding_error().await {
+            status.lock().await.last_error_code = Some("tunnel_forwarding_failed".into());
+            if cleanup(
                 &mut manager,
                 &mut receiver,
                 &status,
@@ -108,18 +112,25 @@ async fn worker(
             )
             .await
             .0
-        {
-            break;
+            {
+                break;
+            }
         }
         match message {
             Some(Some(Message::Connect(credentials, reply))) => {
-                if status.lock().await.connection == "connected" {
+                if status.lock().await.connection == ConnectionPhase::Connected {
                     let _ = reply.send(Response::success(status.lock().await.clone()));
                 } else if let Some(credentials) = credentials {
                     if start(&mut manager, &mut receiver, &status, credentials, reply).await {
                         break;
                     }
                 } else {
+                    {
+                        let mut snapshot = status.lock().await;
+                        snapshot.last_error_code = Some("credentials_required".into());
+                        snapshot.last_error =
+                            Some("Provide campus credentials before connecting".into());
+                    }
                     let _ = reply.send(Response::error(
                         "credentials_required",
                         "Provide campus credentials before connecting",
@@ -188,7 +199,7 @@ async fn start(
 ) -> bool {
     {
         let mut snapshot = status.lock().await;
-        snapshot.connection = "connecting".into();
+        snapshot.connection = ConnectionPhase::Connecting;
         snapshot.connection_info = None;
         snapshot.generation += 1;
     }
@@ -218,9 +229,10 @@ async fn start(
     match result {
         StartResult::Finished(Ok(info)) => {
             let mut snapshot = status.lock().await;
-            snapshot.connection = "connected".into();
+            snapshot.connection = ConnectionPhase::Connected;
             snapshot.connection_info = Some(info);
             snapshot.last_error = None;
+            snapshot.last_error_code = None;
             reply_all(connects, &Response::success(snapshot.clone()));
             false
         }
@@ -234,7 +246,10 @@ async fn start(
                     "connection_timeout",
                     "VPN connection startup timed out".into(),
                 ),
-                StartResult::Finished(Err(error)) => ("connection_failed", error.to_string()),
+                StartResult::Finished(Err(error)) => match error.downcast_ref::<StartupFailure>() {
+                    Some(failure) => (failure.code(), failure.to_string()),
+                    None => ("network_configuration_failed", error.to_string()),
+                },
                 StartResult::Finished(Ok(_)) => unreachable!(),
             };
             let cause = if code == "connection_cancelled" {
@@ -252,6 +267,9 @@ async fn start(
                 shutting_down,
             )
             .await;
+            if code != "connection_cancelled" {
+                status.lock().await.last_error_code = Some(code.into());
+            }
             let mut response = Response::error(code, message);
             if !cleaned.ok {
                 response.message = format!("{}; {}", response.message, cleaned.message);
@@ -271,7 +289,7 @@ async fn cleanup(
     mut shutdowns: Vec<Reply>,
     mut shutting_down: bool,
 ) -> (bool, Response) {
-    status.lock().await.connection = "disconnecting".into();
+    status.lock().await.connection = ConnectionPhase::Disconnecting;
     let mut closed = false;
     let result = {
         let stopping = manager.disconnect();
@@ -297,23 +315,23 @@ async fn cleanup(
         match result {
             Ok(()) => {
                 snapshot.connection = if cause.is_some() && disconnects.is_empty() {
-                    "failed"
+                    ConnectionPhase::Failed
                 } else {
-                    "disconnected"
-                }
-                .into();
+                    ConnectionPhase::Disconnected
+                };
                 if let Some(cause) = cause {
                     snapshot.last_error = Some(cause);
                 }
                 Response::success(snapshot.clone())
             }
             Err(error) => {
-                snapshot.connection = "failed".into();
+                snapshot.connection = ConnectionPhase::Failed;
                 let message = match cause {
                     Some(cause) => format!("{cause}; {error}"),
                     None => error.to_string(),
                 };
                 snapshot.last_error = Some(message.clone());
+                snapshot.last_error_code = Some("cleanup_failed".into());
                 Response::error("cleanup_failed", message)
             }
         }

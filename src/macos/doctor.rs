@@ -11,7 +11,12 @@ use tokio::{
     net::TcpStream,
 };
 
-use super::{Response, connection::ConnectionInfo, network, service::Status};
+use super::{
+    Response,
+    connection::ConnectionInfo,
+    network,
+    service::{ConnectionPhase, Status},
+};
 
 const AUTH_HOST: &str = "zmvpn.cczu.edu.cn";
 const TARGET_IP: &str = "172.22.226.31";
@@ -80,7 +85,7 @@ pub fn override_response(status: &Status, domains: &[String]) -> Response {
     let Some(info) = status
         .connection_info
         .as_ref()
-        .filter(|_| status.connection == "connected")
+        .filter(|_| status.connection == ConnectionPhase::Connected)
     else {
         return Response::error(
             "connection_required",
@@ -261,12 +266,12 @@ pub async fn run(
         "environment": if test_mode { "offline_test" } else { "native" },
         "service": {"status": "passed"},
         "credentials": {"status": if configured { "configured" } else if credentials.ok { "missing" } else { "error" }},
-        "connection": {"state": status.connection, "last_error": status.last_error},
+        "connection": {"state": status.connection, "last_error": status.last_error, "last_error_code": status.last_error_code},
         "routes": {"status": "skipped"},
         "dns": {"authentication": {"status": "not_probed"}, "campus": {"status": "not_requested"}, "active_mihomo_policy": "not_verified"},
         "http": {"url": TARGET_URL, "transport": "skipped", "status_code": null, "business": "not_checked"}
     });
-    let connected = status.connection == "connected";
+    let connected = status.connection == ConnectionPhase::Connected;
     if test_mode {
         data["dns"]["authentication"] = json!({"status": "simulated", "hostname": AUTH_HOST});
         if connected {
