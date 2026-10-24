@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod credentials;
 mod install;
 pub mod service;
 
@@ -26,6 +27,11 @@ pub struct Args {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Manage shared campus credentials without a desktop keychain.
+    Credentials {
+        #[command(subcommand)]
+        action: CredentialAction,
+    },
     /// Query background service and VPN connection separately.
     Status,
     /// Run the privileged system service (normally launched by launchd).
@@ -39,6 +45,29 @@ pub enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+}
+
+#[derive(Subcommand)]
+pub enum CredentialAction {
+    /// Read campus credentials as JSON from standard input.
+    Set {
+        #[arg(long)]
+        stdin: bool,
+        /// Campus username for an interactive initialization.
+        #[arg(long, conflicts_with = "stdin")]
+        user: Option<String>,
+        /// Explicitly persist credentials for later connections.
+        #[arg(long)]
+        save: bool,
+    },
+    /// Report presence only; never reveal stored account or password.
+    Status {
+        /// Ignore credentials persisted on disk; temporary credentials remain available.
+        #[arg(long)]
+        ignore_saved: bool,
+    },
+    /// Forget saved campus credentials.
+    Delete,
 }
 
 #[derive(Subcommand)]
@@ -113,6 +142,38 @@ pub async fn run() -> i32 {
         }
     };
     let response = match args.command {
+        Command::Credentials { action } => {
+            let request = match action {
+                CredentialAction::Set {
+                    stdin: true, save, ..
+                } => match credentials::read_stdin() {
+                    Ok(credentials) => Ok(service::Request::CredentialsSet { credentials, save }),
+                    Err(_) => Err(Response::error(
+                        "invalid_credentials",
+                        "Expected nonempty campus user and password JSON on standard input",
+                    )),
+                },
+                CredentialAction::Set { user, save, .. } => {
+                    match credentials::read_interactive(user, save, args.json) {
+                        Ok((credentials, save)) => {
+                            Ok(service::Request::CredentialsSet { credentials, save })
+                        }
+                        Err(_) => Err(Response::error(
+                            "credentials_required",
+                            "Provide campus credentials with credentials set --stdin, or run interactive initialization in a terminal",
+                        )),
+                    }
+                }
+                CredentialAction::Status { ignore_saved } => {
+                    Ok(service::Request::CredentialsStatus { ignore_saved })
+                }
+                CredentialAction::Delete => Ok(service::Request::CredentialsDelete),
+            };
+            match request {
+                Ok(request) => service::request(&args.socket, &request).await,
+                Err(response) => response,
+            }
+        }
         Command::Status => service::request(&args.socket, &service::Request::Status).await,
         Command::Daemon { test_socket } => match service::run_daemon(test_socket).await {
             Ok(()) => Response::success(json!({"service": "stopped"})),

@@ -15,7 +15,10 @@ use tokio::{
     sync::Mutex,
 };
 
-use super::{Response, SOCKET};
+use super::{
+    Response, SOCKET,
+    credentials::{self, CredentialStore, Credentials},
+};
 
 const MAX_MESSAGE: u64 = 64 * 1024;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,6 +27,15 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
     Status,
+    CredentialsSet {
+        credentials: Credentials,
+        save: bool,
+    },
+    CredentialsStatus {
+        #[serde(default)]
+        ignore_saved: bool,
+    },
+    CredentialsDelete,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -35,11 +47,13 @@ pub struct Status {
 
 pub struct DaemonState {
     pub status: Mutex<Status>,
+    pub credentials: Mutex<CredentialStore>,
 }
 
 impl DaemonState {
-    fn new() -> Self {
+    fn new(directory: PathBuf) -> Self {
         Self {
+            credentials: Mutex::new(CredentialStore::new(directory)),
             status: Mutex::new(Status {
                 service: "running".into(),
                 connection: "disconnected".into(),
@@ -100,6 +114,13 @@ async fn serve_client(stream: UnixStream, state: Arc<DaemonState>) -> Result<()>
     } else {
         match serde_json::from_slice::<Request>(&line) {
             Ok(Request::Status) => Response::success(state.status.lock().await.clone()),
+            Ok(Request::CredentialsSet { credentials, save }) => {
+                state.credentials.lock().await.set(credentials, save)
+            }
+            Ok(Request::CredentialsStatus { ignore_saved }) => {
+                state.credentials.lock().await.status(ignore_saved)
+            }
+            Ok(Request::CredentialsDelete) => state.credentials.lock().await.delete(),
             Err(_) => Response::error(
                 "invalid_arguments",
                 "Unknown command or malformed control request",
@@ -140,6 +161,11 @@ pub async fn run_daemon(test_socket: Option<PathBuf>) -> Result<()> {
     let socket = test_socket.unwrap_or_else(|| PathBuf::from(SOCKET));
     ensure!(socket.is_absolute(), "Socket path must be absolute");
     let parent = socket.parent().context("Socket has no parent directory")?;
+    let credential_directory = if test_mode {
+        parent.join("data")
+    } else {
+        PathBuf::from(credentials::DATA_DIR)
+    };
     if !test_mode {
         fs::create_dir_all(parent)?;
     }
@@ -174,7 +200,7 @@ pub async fn run_daemon(test_socket: Option<PathBuf>) -> Result<()> {
         &socket,
         fs::Permissions::from_mode(if test_mode { 0o600 } else { 0o666 }),
     )?;
-    let state = Arc::new(DaemonState::new());
+    let state = Arc::new(DaemonState::new(credential_directory));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     // A detached service does not treat an SSH session hangup as a VPN shutdown.
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
