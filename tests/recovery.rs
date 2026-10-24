@@ -147,3 +147,220 @@ fn journal_from_another_boot_cannot_delete_a_matching_route() {
     drop(daemon);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn staged_uninstall_recovers_owned_resources_and_preserves_saved_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp();
+    let stage = dir.join("stage");
+    let mut daemon = Daemon::start(dir.clone());
+    daemon.connect();
+    daemon.kill();
+    fs::create_dir(&stage).unwrap();
+    assert_eq!(
+        call(
+            &dir,
+            &[
+                "service",
+                "install",
+                "--staging-dir",
+                stage.to_str().unwrap()
+            ],
+            None
+        )
+        .0,
+        0
+    );
+    let data = stage.join("var/db/cczu-vpn");
+    fs::create_dir_all(&data).unwrap();
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+    for name in ["network-journal.json", "offline-routes.json"] {
+        fs::copy(dir.join("data").join(name), data.join(name)).unwrap();
+    }
+    fs::write(
+        data.join("credentials.json"),
+        br#"{"user":"test","password":"retained"}"#,
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let (code, response) = call(
+            &dir,
+            &[
+                "service",
+                "uninstall",
+                "--staging-dir",
+                stage.to_str().unwrap(),
+            ],
+            None,
+        );
+        assert_eq!(code, 0, "{response}");
+    }
+    let table: Value =
+        serde_json::from_slice(&fs::read(data.join("offline-routes.json")).unwrap()).unwrap();
+    assert_eq!(table, json!([]));
+    assert!(data.join("credentials.json").exists());
+    drop(daemon);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn uninstall_refuses_to_remove_a_replaced_executable() {
+    let dir = temp();
+    fs::create_dir(&dir).unwrap();
+    assert_eq!(
+        call(
+            &dir,
+            &["service", "install", "--staging-dir", dir.to_str().unwrap()],
+            None
+        )
+        .0,
+        0
+    );
+    let binary = dir.join("usr/local/libexec/cczu-vpn-proto");
+    fs::write(&binary, b"third-party executable").unwrap();
+    let (code, response) = call(
+        &dir,
+        &[
+            "service",
+            "uninstall",
+            "--staging-dir",
+            dir.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert_ne!(code, 0, "{response}");
+    assert_eq!(fs::read(&binary).unwrap(), b"third-party executable");
+    assert!(
+        dir.join("Library/LaunchDaemons/edu.cczu.vpn.plist")
+            .exists()
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn hangup_preserves_connection_and_normal_service_stop_cleans_routes() {
+    let dir = temp();
+    let mut daemon = Daemon::start(dir.clone());
+    daemon.connect();
+    assert_eq!(
+        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGHUP) },
+        0
+    );
+    thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        call(&dir, &["status"], None).1["data"]["connection"],
+        "connected"
+    );
+    assert_eq!(
+        unsafe { libc::kill(daemon.child.id() as i32, libc::SIGTERM) },
+        0
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = daemon.child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "service shutdown did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(dir.join("data/offline-routes.json")).unwrap())
+            .unwrap(),
+        json!([])
+    );
+    drop(daemon);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn changed_routes_survive_restart_and_block_new_connections_until_conflict_is_removed() {
+    let dir = temp();
+    let mut daemon = Daemon::start(dir.clone());
+    daemon.connect();
+    daemon.kill();
+    let path = dir.join("data/offline-routes.json");
+    let mut table: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    table[0]["interface"] = json!("utun-foreign");
+    table[0]["owner"] = json!("another-service");
+    let foreign = table[0].clone();
+    fs::write(&path, serde_json::to_vec(&table).unwrap()).unwrap();
+    let mut restarted = Daemon::start(dir.clone());
+    let status = call(&dir, &["status"], None).1;
+    assert_eq!(status["data"]["connection"], "failed");
+    assert!(
+        status["data"]["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("changed")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+        json!([foreign])
+    );
+    assert_ne!(
+        call(
+            &dir,
+            &["connect", "--stdin"],
+            Some(json!({"user":"test","password":"secret"}))
+        )
+        .0,
+        0
+    );
+    restarted.kill();
+    fs::write(&path, b"[]").unwrap();
+    let last = Daemon::start(dir.clone());
+    assert_eq!(
+        call(&dir, &["status"], None).1["data"]["connection"],
+        "disconnected"
+    );
+    drop(last);
+    drop(restarted);
+    drop(daemon);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn disconnect_never_adopts_matching_preexisting_routes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = temp();
+    let daemon = Daemon::start(dir.clone());
+    let path = dir.join("data/offline-routes.json");
+    let foreign = json!([{"network":{"destination":"172.22.0.0","netmask":"255.255.0.0"},"interface":"utun-test","gateway":null,"marked":true,"owner":"third-party"}]);
+    fs::write(&path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    daemon.connect();
+    assert_eq!(call(&dir, &["disconnect"], None).0, 0);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(&path).unwrap()).unwrap(),
+        foreign
+    );
+    drop(daemon);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn recovery_reconciles_write_ahead_intent_with_current_resource_ownership() {
+    let dir = temp();
+    let mut daemon = Daemon::start(dir.clone());
+    daemon.connect();
+    daemon.kill();
+    let path = dir.join("data/network-journal.json");
+    let mut journal: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    // The kernel mutation completed, but the process died before confirming it.
+    journal["pending"] = json!([journal["routes"][0]["network"].clone()]);
+    fs::write(&path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    let restarted = Daemon::start(dir.clone());
+    assert_eq!(
+        call(&dir, &["status"], None).1["data"]["connection"],
+        "disconnected"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(dir.join("data/offline-routes.json")).unwrap())
+            .unwrap(),
+        json!([])
+    );
+    drop(restarted);
+    drop(daemon);
+    fs::remove_dir_all(dir).unwrap();
+}

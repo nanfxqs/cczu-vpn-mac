@@ -75,7 +75,7 @@ impl ConnectionManager {
             ),
             Some(scenario) => ActiveConnection::Offline {
                 scenario,
-                info: None,
+                info: Box::new(None),
                 connected_at: None,
                 routes,
             },
@@ -156,7 +156,7 @@ enum ActiveConnection {
     Native(Box<NativeConnection>),
     Offline {
         scenario: TestScenario,
-        info: Option<ConnectionInfo>,
+        info: Box<Option<ConnectionInfo>>,
         connected_at: Option<Instant>,
         routes: RouteSet,
     },
@@ -166,7 +166,7 @@ impl ActiveConnection {
     fn info(&self) -> Option<&ConnectionInfo> {
         match self {
             Self::Native(connection) => connection.info.as_ref(),
-            Self::Offline { info, .. } => info.as_ref(),
+            Self::Offline { info, .. } => info.as_ref().as_ref(),
         }
     }
     async fn start(&mut self, credentials: Credentials) -> Result<ConnectionInfo> {
@@ -242,7 +242,7 @@ impl ActiveConnection {
                         .collect::<Result<_>>()?,
                     backend: "offline".into(),
                 };
-                *info = Some(ready.clone());
+                **info = Some(ready.clone());
                 *connected_at = Some(Instant::now());
                 Ok(ready)
             }
@@ -258,7 +258,7 @@ impl ActiveConnection {
                 ..
             } => {
                 routes.cleanup().await?;
-                *info = None;
+                **info = None;
                 *connected_at = None;
                 Ok(())
             }

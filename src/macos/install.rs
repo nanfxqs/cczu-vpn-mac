@@ -7,9 +7,12 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{Response, ServiceAction, service::effective_uid};
+use super::{
+    Response, ServiceAction, credentials::DATA_DIR, network::RouteSet, service::effective_uid,
+};
 
 const LABEL: &str = "edu.cczu.vpn";
 const BINARY: &str = "/usr/local/libexec/cczu-vpn-proto";
@@ -99,21 +102,107 @@ fn launchctl(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct BinaryIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: i64,
+    modified_nsec: i64,
+    changed: i64,
+    changed_nsec: i64,
+}
+
+fn binary_identity(path: &Path) -> Result<BinaryIdentity> {
+    let meta = fs::symlink_metadata(path)?;
+    ensure!(
+        meta.is_file()
+            && !meta.file_type().is_symlink()
+            && meta.uid() == effective_uid()
+            && meta.mode() & 0o022 == 0,
+        "Refusing unrelated installation executable"
+    );
+    Ok(BinaryIdentity {
+        device: meta.dev(),
+        inode: meta.ino(),
+        size: meta.len(),
+        modified: meta.mtime(),
+        modified_nsec: meta.mtime_nsec(),
+        changed: meta.ctime(),
+        changed_nsec: meta.ctime_nsec(),
+    })
+}
+
+fn validate_existing(staging: Option<&Path>) -> Result<bool> {
+    let manifest = location(staging, DATA_DIR).join("install.json");
+    let identity: Option<BinaryIdentity> = super::network::read_state(&manifest)?;
+    let binary = location(staging, BINARY);
+    if fs::symlink_metadata(&binary).is_ok() {
+        ensure!(
+            identity.as_ref() == Some(&binary_identity(&binary)?),
+            "Installed executable changed or has no ownership record; left untouched"
+        );
+    }
+    let plist = location(staging, PLIST);
+    let mut owned_plist = false;
+    if let Ok(meta) = fs::symlink_metadata(&plist) {
+        ensure!(
+            meta.is_file()
+                && !meta.file_type().is_symlink()
+                && meta.uid() == effective_uid()
+                && fs::read_to_string(&plist)? == definition(),
+            "Service definition changed; unrelated configuration left untouched"
+        );
+        owned_plist = true;
+    }
+    let link = location(staging, CLI_LINK);
+    if let Ok(meta) = fs::symlink_metadata(&link) {
+        ensure!(
+            meta.file_type().is_symlink() && fs::read_link(&link)? == Path::new(BINARY),
+            "Unrelated CLI path left untouched"
+        );
+    }
+    Ok(identity.is_some() && owned_plist)
+}
+
 fn stop() -> Result<()> {
     let target = format!("system/{LABEL}");
     let loaded = Command::new("/bin/launchctl")
         .args(["print", &target])
         .output()?;
     if loaded.status.success() {
+        ensure!(
+            validate_existing(None)?,
+            "Cannot prove loaded service belongs to this installation"
+        );
         launchctl(&["bootout", &target])?;
     }
     Ok(())
 }
 
+fn recover(staging: Option<&Path>) -> Result<()> {
+    let directory = location(staging, DATA_DIR);
+    if !directory.exists() {
+        return Ok(());
+    }
+    let offline = staging.is_some();
+    // execute() is called inside the CLI Tokio runtime. Recovery gets its own
+    // short-lived runtime so synchronous launchctl management remains unchanged.
+    std::thread::spawn(move || -> Result<()> {
+        tokio::runtime::Runtime::new()?.block_on(RouteSet::recover(directory, offline))
+    })
+    .join()
+    .map_err(|_| anyhow::anyhow!("Network recovery task failed"))??;
+    Ok(())
+}
+
 fn install(staging: Option<&Path>) -> Result<()> {
+    validate_existing(staging)?;
     if staging.is_none() {
         stop()?;
     }
+    recover(staging)?;
     let binary = location(staging, BINARY);
     let link = location(staging, CLI_LINK);
     directory(link.parent().context("Missing CLI directory")?)?;
@@ -125,6 +214,15 @@ fn install(staging: Option<&Path>) -> Result<()> {
         );
     }
     write_atomic(&binary, &fs::read(std::env::current_exe()?)?, 0o755)?;
+    directory(
+        location(staging, DATA_DIR)
+            .parent()
+            .context("Missing state parent")?,
+    )?;
+    super::network::write_state(
+        &location(staging, DATA_DIR).join("install.json"),
+        &binary_identity(&binary)?,
+    )?;
     write_atomic(&location(staging, PLIST), definition().as_bytes(), 0o644)?;
     if fs::symlink_metadata(&link).is_err() {
         symlink(BINARY, &link)?;
@@ -137,9 +235,11 @@ fn install(staging: Option<&Path>) -> Result<()> {
 }
 
 fn uninstall(staging: Option<&Path>) -> Result<()> {
+    validate_existing(staging)?;
     if staging.is_none() {
         stop()?;
     }
+    recover(staging)?;
     let plist = location(staging, PLIST);
     if plist.exists() {
         ensure!(
@@ -163,6 +263,12 @@ fn uninstall(staging: Option<&Path>) -> Result<()> {
             );
             fs::remove_file(path)?;
         }
+    }
+    let manifest = location(staging, DATA_DIR).join("install.json");
+    match fs::remove_file(manifest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
@@ -194,7 +300,7 @@ pub fn execute(action: ServiceAction) -> Response {
     }
     let result = match &action {
         ServiceAction::Install { .. } => install(staging),
-        ServiceAction::Stop => stop(),
+        ServiceAction::Stop => stop().and_then(|()| recover(None)),
         ServiceAction::Uninstall { .. } => uninstall(staging),
     };
     match result {

@@ -246,7 +246,9 @@ impl OwnedRoute {
             args.push("-proto2".into());
         }
         match self.gateway {
-            Some(gateway) => args.push(gateway.to_string()),
+            Some(gateway) => {
+                args.extend([gateway.to_string(), "-ifp".into(), self.interface.clone()])
+            }
             None => args.extend(["-interface".into(), self.interface.clone()]),
         }
         Ok(args)
