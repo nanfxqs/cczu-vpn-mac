@@ -1,4 +1,5 @@
 //! Narrow macOS route adapter: explicit adds, verified ownership, reverse cleanup.
+use super::service::effective_uid;
 use anyhow::{Context, Result, bail, ensure};
 use cczuvpnproto::{
     routes::{
@@ -6,8 +7,13 @@ use cczuvpnproto::{
     },
     types::ProxyServer,
 };
+use serde::{Deserialize, Serialize};
 use std::{
+    fs::{self, OpenOptions},
+    io::{Read, Write},
     net::{IpAddr, Ipv4Addr},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
     process::Output,
     time::Duration,
 };
@@ -25,11 +31,15 @@ async fn command(program: &str, args: &[String]) -> Result<Output> {
     .context("Could not execute network command")
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RouteSnapshot {
     pub network: Option<Ipv4Route>,
     pub gateway: Option<Ipv4Addr>,
     pub interface: String,
+    #[serde(default)]
+    pub marked: bool,
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 impl RouteSnapshot {
@@ -61,6 +71,8 @@ impl RouteSnapshot {
             network,
             gateway,
             interface,
+            marked: field("flags").is_some_and(|flags| flags.contains("PROTO2")),
+            owner: None,
         })
     }
 
@@ -83,6 +95,44 @@ pub async fn lookup(target: &str) -> Result<Option<RouteSnapshot>> {
     Ok(Some(RouteSnapshot::parse(&String::from_utf8_lossy(
         &output.stdout,
     ))?))
+}
+
+// route get performs longest-prefix lookup. A more-specific foreign route
+// must not make us forget a still-present owned parent route.
+async fn exact_route_exists(network: Ipv4Route) -> Result<bool> {
+    let output = command(
+        "/usr/sbin/netstat",
+        &["-rn".into(), "-f".into(), "inet".into()],
+    )
+    .await?;
+    ensure!(
+        output.status.success(),
+        "Could not inspect exact IPv4 routes"
+    );
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(destination) = line.split_whitespace().next() else {
+            continue;
+        };
+        let (address, prefix) = destination
+            .split_once('/')
+            .map_or((destination, None), |(a, p)| (a, Some(p)));
+        let octets: Vec<_> = address.split('.').collect();
+        if octets.len() > 4 || octets.iter().any(|part| part.parse::<u8>().is_err()) {
+            continue;
+        }
+        let mut full = octets.join(".");
+        for _ in octets.len()..4 {
+            full.push_str(".0");
+        }
+        let prefix = match prefix {
+            Some(p) => p.to_string(),
+            None => (octets.len() * 8).to_string(),
+        };
+        if parse_split_tunnel_route(&format!("{full}/{prefix}"))? == Some(network) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn cidr(route: Ipv4Route) -> Result<String> {
@@ -172,7 +222,7 @@ pub fn campus_routes(server: &ProxyServer, protected: &[Ipv4Route]) -> Result<Ve
     Ok(routes)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct OwnedRoute {
     pub network: Ipv4Route,
     pub interface: String,
@@ -192,6 +242,9 @@ impl OwnedRoute {
             "-net".into(),
             cidr(self.network)?,
         ];
+        if action == "add" {
+            args.push("-proto2".into());
+        }
         match self.gateway {
             Some(gateway) => args.push(gateway.to_string()),
             None => args.extend(["-interface".into(), self.interface.clone()]),
@@ -200,14 +253,268 @@ impl OwnedRoute {
     }
 }
 
+// The journal is an intent log: persist BEFORE mutation. A process death or
+// command timeout must not lose the list of potentially-created resources.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Journal {
+    version: u32,
+    owner: String,
+    routes: Vec<OwnedRoute>,
+    pending: Vec<Ipv4Route>,
+    boot: i64,
+}
+
 #[derive(Default)]
 pub struct RouteSet {
     pub owned: Vec<OwnedRoute>,
+    directory: Option<PathBuf>,
+    offline: bool,
+    owner: String,
+    recovered: bool,
+    pending: Vec<Ipv4Route>,
+    boot: i64,
+    same_boot: bool,
+}
+
+fn private_directory(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => ensure!(
+            meta.is_dir()
+                && !meta.file_type().is_symlink()
+                && meta.uid() == effective_uid()
+                && meta.mode() & 0o077 == 0,
+            "Network state directory must be private and owned by the service"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::DirBuilder::new().mode(0o700).create(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+pub(super) fn read_state<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let meta = file.metadata()?;
+    ensure!(
+        meta.is_file()
+            && meta.uid() == effective_uid()
+            && meta.mode() & 0o777 == 0o600
+            && meta.nlink() == 1,
+        "Unsafe network state file"
+    );
+    let mut bytes = Vec::new();
+    file.take(256 * 1024 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 256 * 1024, "Network state is too large");
+    Ok(Some(
+        serde_json::from_slice(&bytes).context("Invalid network ownership state")?,
+    ))
+}
+
+pub(super) fn write_state(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path.parent().context("Missing network state directory")?;
+    private_directory(parent)?;
+    // Existing state must have the same protections as a newly-created file.
+    if fs::symlink_metadata(path).is_ok() {
+        let _: Option<serde_json::Value> = read_state(path)?;
+    }
+    let temporary = parent.join(format!(".network-{:016x}", rand::random::<u64>()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&serde_json::to_vec(value)?)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn boot_epoch() -> Result<i64> {
+    let mut value: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::timeval>();
+    // Read-only kernel boot identity; no credentials or system changes.
+    let result = unsafe {
+        libc::sysctlbyname(
+            c"kern.boottime".as_ptr(),
+            (&mut value as *mut libc::timeval).cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    ensure!(
+        result == 0 && len == std::mem::size_of::<libc::timeval>(),
+        "Could not identify system boot for route ownership"
+    );
+    Ok(value.tv_sec)
 }
 
 impl RouteSet {
+    pub fn persistent(directory: PathBuf, offline: bool) -> Result<Self> {
+        private_directory(&directory)?;
+        let existing: Option<Journal> = read_state(&directory.join("network-journal.json"))?;
+        let boot = if offline { 0 } else { boot_epoch()? };
+        let mut same_boot = true;
+        let mut journal_boot = boot;
+        let (owner, owned, recovered, pending) = match existing {
+            Some(journal) => {
+                ensure!(
+                    journal.version == 1
+                        && !journal.owner.is_empty()
+                        && journal.routes.len() <= 512,
+                    "Invalid network journal version or contents"
+                );
+                for route in &journal.routes {
+                    ensure!(
+                        netmask_to_prefix(route.network.netmask)? >= 8
+                            && usable(route.network.destination)
+                            && route
+                                .interface
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                            && !route.interface.is_empty(),
+                        "Unsafe route in network journal"
+                    );
+                }
+                same_boot = journal.boot == boot;
+                journal_boot = journal.boot;
+                let recovered = !journal.routes.is_empty();
+                (journal.owner, journal.routes, recovered, journal.pending)
+            }
+            None => (
+                format!("{:032x}", rand::random::<u128>()),
+                Vec::new(),
+                false,
+                Vec::new(),
+            ),
+        };
+        Ok(Self {
+            owned,
+            directory: Some(directory),
+            offline,
+            owner,
+            recovered,
+            pending,
+            boot: journal_boot,
+            same_boot,
+        })
+    }
+
+    pub async fn recover(directory: PathBuf, offline: bool) -> Result<()> {
+        Self::persistent(directory, offline)?.cleanup().await
+    }
+
+    fn persist(&self) -> Result<()> {
+        if let Some(directory) = &self.directory {
+            write_state(
+                &directory.join("network-journal.json"),
+                &Journal {
+                    version: 1,
+                    owner: self.owner.clone(),
+                    routes: self.owned.clone(),
+                    pending: self.pending.clone(),
+                    boot: self.boot,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn current(&self, route: &OwnedRoute) -> Result<Option<RouteSnapshot>> {
+        if self.offline {
+            let path = self
+                .directory
+                .as_ref()
+                .context("Missing offline state directory")?
+                .join("offline-routes.json");
+            let table: Vec<RouteSnapshot> = read_state(&path)?.unwrap_or_default();
+            Ok(table
+                .into_iter()
+                .find(|entry| entry.network == Some(route.network)))
+        } else {
+            let current = lookup(&route.network.destination.to_string()).await?;
+            if current
+                .as_ref()
+                .is_some_and(|entry| entry.network == Some(route.network))
+            {
+                return Ok(current);
+            }
+            ensure!(
+                !exact_route_exists(route.network).await?,
+                "Owned route is shadowed by a different route; left untouched"
+            );
+            Ok(None)
+        }
+    }
+
+    fn is_owned(&self, route: &OwnedRoute, current: &RouteSnapshot) -> bool {
+        route.matches(current)
+            && current.marked
+            && (!self.offline || current.owner.as_deref() == Some(&self.owner))
+    }
+
+    async fn mutate(&self, route: &OwnedRoute, action: &str) -> Result<()> {
+        if self.offline {
+            let path = self
+                .directory
+                .as_ref()
+                .context("Missing offline state directory")?
+                .join("offline-routes.json");
+            let mut table: Vec<RouteSnapshot> = read_state(&path)?.unwrap_or_default();
+            match action {
+                "add" => {
+                    ensure!(
+                        !table
+                            .iter()
+                            .any(|entry| entry.network == Some(route.network)),
+                        "Offline route already exists"
+                    );
+                    table.push(RouteSnapshot {
+                        network: Some(route.network),
+                        gateway: route.gateway,
+                        interface: route.interface.clone(),
+                        marked: true,
+                        owner: Some(self.owner.clone()),
+                    });
+                }
+                "delete" => table.retain(|entry| entry.network != Some(route.network)),
+                _ => bail!("Invalid route operation"),
+            }
+            return write_state(&path, &table);
+        }
+        let output = command("/sbin/route", &route.arguments(action)?).await?;
+        ensure!(
+            output.status.success(),
+            "Could not {action} campus/endpoint route {}: {}",
+            cidr(route.network)?,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        Ok(())
+    }
+
     pub async fn add(&mut self, route: OwnedRoute) -> Result<()> {
-        if let Some(current) = lookup(&route.network.destination.to_string()).await?
+        ensure!(
+            !self.recovered || self.owned.is_empty(),
+            "Previous network recovery must finish before connecting"
+        );
+        if let Some(current) = self.current(&route).await?
             && current.network == Some(route.network)
         {
             ensure!(
@@ -215,22 +522,21 @@ impl RouteSet {
                 "A pre-existing route conflicts with {}",
                 cidr(route.network)?
             );
-            return Ok(()); // Never adopt or later delete pre-existing routes.
+            return Ok(()); // Never adopt a pre-existing route, even with our marker.
         }
-        let output = command("/sbin/route", &route.arguments("add")?).await?;
-        ensure!(
-            output.status.success(),
-            "Could not add campus/endpoint route {}: {}",
-            cidr(route.network)?,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
         self.owned.push(route.clone());
-        let current = lookup(&route.network.destination.to_string())
+        self.pending.push(route.network);
+        self.persist()?; // Write-ahead, including mutations whose result may be uncertain.
+        self.mutate(&route, "add").await?;
+        self.pending.retain(|network| *network != route.network);
+        self.persist()?;
+        let current = self
+            .current(&route)
             .await?
             .context("New route is not visible")?;
         ensure!(
-            route.matches(&current),
-            "New route did not select the expected interface/gateway"
+            self.is_owned(&route, &current),
+            "New route did not select expected ownership/interface/gateway"
         );
         Ok(())
     }
@@ -240,27 +546,53 @@ impl RouteSet {
         for index in (0..self.owned.len()).rev() {
             let route = &self.owned[index];
             let result = async {
-                match lookup(&route.network.destination.to_string()).await? {
-                    Some(current) if route.matches(&current) => {
-                        let output = command("/sbin/route", &route.arguments("delete")?).await?;
+                match self.current(route).await? {
+                    Some(current) if self.is_owned(route, &current) => {
                         ensure!(
-                            output.status.success(),
-                            "Could not remove owned route {}",
+                            self.same_boot,
+                            "Route journal belongs to another boot; matching route left untouched"
+                        );
+                        ensure!(
+                            self.offline || !self.pending.contains(&route.network),
+                            "Uncertain route mutation {}; ownership not confirmed, left untouched",
                             cidr(route.network)?
                         );
+                        // utun names can be reused after death. A recovered journal does
+                        // not own an open fd, so never infer live interface ownership.
+                        ensure!(
+                            !self.recovered || self.offline || !route.interface.starts_with("utun"),
+                            "Cannot prove recovered utun ownership; route {} left untouched",
+                            cidr(route.network)?
+                        );
+                        self.mutate(route, "delete").await?;
+                        if let Some(current) = self.current(route).await? {
+                            ensure!(
+                                !self.is_owned(route, &current),
+                                "Owned route remains after deletion"
+                            );
+                        }
                     }
                     Some(current) if current.network == Some(route.network) => bail!(
                         "Owned route {} changed; left untouched",
                         cidr(route.network)?
                     ),
-                    _ => {} // Route is already absent, not a reason to touch another prefix.
+                    _ => {} // Already gone; never touch a less/more-specific replacement.
                 }
                 Ok::<_, anyhow::Error>(())
             }
             .await;
             match result {
                 Ok(()) => {
-                    self.owned.remove(index);
+                    let removed = self.owned.remove(index);
+                    let was_pending = self.pending.contains(&removed.network);
+                    self.pending.retain(|network| *network != removed.network);
+                    if let Err(error) = self.persist() {
+                        if was_pending {
+                            self.pending.push(removed.network);
+                        }
+                        self.owned.insert(index, removed);
+                        errors.push(error.to_string());
+                    }
                 }
                 Err(error) => errors.push(error.to_string()),
             }
@@ -270,6 +602,10 @@ impl RouteSet {
             "Network cleanup incomplete: {}",
             errors.join("; ")
         );
+        self.recovered = false;
+        self.boot = if self.offline { 0 } else { boot_epoch()? };
+        self.same_boot = true;
+        self.persist()?;
         Ok(())
     }
 }

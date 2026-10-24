@@ -62,7 +62,7 @@ pub struct DaemonState {
 }
 
 impl DaemonState {
-    fn new(directory: PathBuf, scenario: Option<TestScenario>) -> Self {
+    async fn new(directory: PathBuf, scenario: Option<TestScenario>) -> Self {
         let status = Arc::new(Mutex::new(Status {
             generation: 0,
             service: "running".into(),
@@ -71,8 +71,12 @@ impl DaemonState {
             connection_info: None,
         }));
         Self {
-            credentials: Mutex::new(CredentialStore::new(directory)),
-            connection: ConnectionControl::new(ConnectionManager::new(scenario), status.clone()),
+            credentials: Mutex::new(CredentialStore::new(directory.clone())),
+            connection: ConnectionControl::new(
+                ConnectionManager::new(scenario, directory),
+                status.clone(),
+            )
+            .await,
             status,
         }
     }
@@ -243,10 +247,13 @@ pub async fn run_daemon(test_socket: Option<PathBuf>, test_scenario: TestScenari
         &socket,
         fs::Permissions::from_mode(if test_mode { 0o600 } else { 0o666 }),
     )?;
-    let state = Arc::new(DaemonState::new(
-        credential_directory,
-        if test_mode { Some(test_scenario) } else { None },
-    ));
+    let state = Arc::new(
+        DaemonState::new(
+            credential_directory,
+            if test_mode { Some(test_scenario) } else { None },
+        )
+        .await,
+    );
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     // A detached service does not treat an SSH session hangup as a VPN shutdown.
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;

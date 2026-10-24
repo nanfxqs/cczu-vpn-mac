@@ -23,7 +23,12 @@ pub struct ConnectionControl {
 }
 
 impl ConnectionControl {
-    pub fn new(manager: ConnectionManager, status: Arc<Mutex<Status>>) -> Self {
+    pub async fn new(mut manager: ConnectionManager, status: Arc<Mutex<Status>>) -> Self {
+        if let Err(error) = manager.recover().await {
+            let mut snapshot = status.lock().await;
+            snapshot.connection = "failed".into();
+            snapshot.last_error = Some(error.to_string());
+        }
         let (sender, receiver) = mpsc::channel(32);
         tokio::spawn(worker(manager, receiver, status));
         Self {
