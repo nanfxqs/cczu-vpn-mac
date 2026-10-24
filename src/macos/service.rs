@@ -62,8 +62,8 @@ pub struct DaemonState {
 impl DaemonState {
     fn new(directory: PathBuf, scenario: Option<TestScenario>) -> Self {
         Self {
-            credentials: Mutex::new(CredentialStore::new(directory)),
-            connection: Mutex::new(ConnectionManager::new(scenario)),
+            credentials: Mutex::new(CredentialStore::new(directory.clone())),
+            connection: Mutex::new(ConnectionManager::new(scenario, directory)),
             status: Mutex::new(Status {
                 service: "running".into(),
                 connection: "disconnected".into(),
@@ -292,6 +292,11 @@ pub async fn run_daemon(test_socket: Option<PathBuf>, test_scenario: TestScenari
         credential_directory,
         if test_mode { Some(test_scenario) } else { None },
     ));
+    if let Err(error) = state.connection.lock().await.recover().await {
+        let mut status = state.status.lock().await;
+        status.connection = "failed".into();
+        status.last_error = Some(format!("Network recovery incomplete: {error}"));
+    }
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     // A detached service does not treat an SSH session hangup as a VPN shutdown.
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
