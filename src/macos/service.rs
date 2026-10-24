@@ -124,7 +124,11 @@ pub async fn request(socket: &Path, request: &Request) -> Response {
     .await;
     match result {
         Ok(Ok(response)) => response,
-        _ => {
+        Err(_) => Response::error(
+            "operation_timeout",
+            "CLI wait timed out; query status before retrying the operation",
+        ),
+        Ok(Err(_)) => {
             let mut response = Response::error(
                 "service_unavailable",
                 "VPN background service unavailable; install/start it with service install",

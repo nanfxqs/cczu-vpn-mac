@@ -96,8 +96,8 @@ async fn worker(
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     loop {
         let message = tokio::select! {message=receiver.recv()=>Some(message),_ = tick.tick()=>None};
-        if let Some(error) = manager.forwarding_error().await {
-            if cleanup(
+        if let Some(error) = manager.forwarding_error().await
+            && cleanup(
                 &mut manager,
                 &mut receiver,
                 &status,
@@ -108,9 +108,8 @@ async fn worker(
             )
             .await
             .0
-            {
-                break;
-            }
+        {
+            break;
         }
         match message {
             Some(Some(Message::Connect(credentials, reply))) => {

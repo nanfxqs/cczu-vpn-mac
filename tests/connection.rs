@@ -114,6 +114,14 @@ impl Fixture {
 struct Pending(Option<Child>);
 impl Pending {
     fn finish(mut self) -> (i32, Value) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "offline CLI operation did not finish"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
         let output = self.0.take().unwrap().wait_with_output().unwrap();
         (
             output.status.code().unwrap(),
@@ -265,7 +273,7 @@ fn startup_deadline_cleans_up_and_preserves_a_machine_readable_timeout() {
     let fixture = Fixture::start("startup-timeout");
     fixture.credentials();
     let started = Instant::now();
-    let (code, result) = fixture.call(&["connect"], None);
+    let (code, result) = fixture.pending(&["connect"]).finish();
     assert_eq!(code, 5);
     assert_eq!(result["code"], "connection_timeout");
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -277,6 +285,39 @@ fn startup_deadline_cleans_up_and_preserves_a_machine_readable_timeout() {
             .contains("timed out")
     );
     assert_eq!(fixture.call(&["disconnect"], None).0, 0);
+}
+
+#[test]
+fn concurrent_connects_share_one_attempt_and_idle_connections_stay_connected() {
+    let fixture = Fixture::start("slow-ready");
+    fixture.credentials();
+    let first = fixture.pending(&["connect"]);
+    fixture.wait_for("connecting");
+    let second = fixture.pending(&["connect"]);
+    for pending in [first, second] {
+        let (code, ready) = pending.finish();
+        assert_eq!(code, 0, "{ready}");
+        assert_eq!(ready["data"]["generation"], 1);
+    }
+    assert_eq!(fixture.call(&["credentials", "delete"], None).0, 0);
+    assert_eq!(
+        fixture.call(&["connect"], None).1["data"]["generation"],
+        1,
+        "idempotent connect must not require deleted credentials"
+    );
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        fixture.call(&["status"], None).1["data"]["connection"],
+        "connected"
+    );
+    let first = fixture.pending(&["disconnect"]);
+    let second = fixture.pending(&["disconnect"]);
+    assert_eq!(first.finish().0, 0);
+    assert_eq!(second.finish().0, 0);
+    assert_eq!(
+        fixture.call(&["status"], None).1["data"]["connection"],
+        "disconnected"
+    );
 }
 
 #[test]
