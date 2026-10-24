@@ -62,6 +62,34 @@ Omit `--save` to use temporary credentials until the background service restarts
 
 JSON-mode and non-terminal initialization never prompt. Missing input returns `credentials_required`, malformed or empty JSON credentials return `invalid_credentials`, and storage failures return `credential_store_error`; each uses operation-failed exit code `5`. Initialization does not save unless explicitly selected. Secrets must come from a source controlled by the caller; do not embed real passwords in shell history, logs or example commands.
 
+## Read-only diagnosis and campus DNS preparation
+
+```sh
+cczu-vpn-proto --json doctor
+cczu-vpn-proto --json doctor --domain YOUR-INTERNAL-HOST.cczu.edu.cn
+```
+
+Replace the example with an actual lowercase campus hostname. The current acceptance resource is an IP address, so domain-specific DNS preparation is optional until a domain that needs internal resolution is identified. `doctor` does not change routes, DNS settings, mihomo configuration or school business data. It reports service availability, whether credentials are configured, connection state, the route to `172.22.226.31`, public VPN authentication hostname resolution, and a bounded direct TCP HTTP `HEAD /` probe to the known resource. It does not send credentials to the website, read its body, follow redirects or perform login operations. Its HTTP probe bypasses HTTP proxy environment settings; application/mihomo proxy rules need separate verification.
+
+Each result keeps transport and HTTP response status separate: any valid HTTP response demonstrates HTTP transport reachability, including redirects, authentication errors and `405 Method Not Allowed`. A `503` response is reported as a non-success business response, not automatically a tunnel failure. Doctor exit `0` means the requested live checks passed, `5` means checks need attention (including a deliberately disconnected VPN), and `3` means the control service is unavailable. JSON results preserve details even for nonzero exits. Human output also includes check details.
+
+When exact campus hostnames are supplied, native diagnostics compare system resolution with an explicit query to the DNS advertised by the current VPN session. Public authentication resolution is checked even while disconnected. The report always identifies active mihomo policy as `not_verified`: neither a real resolved address nor the repository's override fragment proves the running mihomo has loaded the intended policy.
+
+After a native VPN connection is active, obtain a one-time **merge fragment** using the actual DNS address from authorization:
+
+```sh
+cczu-vpn-proto --json doctor --dns-override --domain actual-internal-host.cczu.edu.cn \
+  | jq -r '.data.yaml // empty' > campus-dns-override.yaml
+```
+
+The command returns YAML in `data.yaml` with `applied: false`; it does not write or reload mihomo. It refuses disconnected sessions, offline fixture DNS, unsupported DNS addresses, the root school suffix and the VPN authentication hostname. Merge the fragment's entries into the existing override during environment preparation, keeping existing configuration. Subsequent `connect`/`disconnect` operations never reconfigure mihomo.
+
+The fragment retains `+.cczu.edu.cn` in the Fake IP exclusion list and maps only the explicitly selected exact hostnames to the advertised DNS using `#DIRECT`. It does not change the public authentication hostname's resolver, so adding an internal-only DNS does not create a VPN bootstrap dependency. Selected internal hostnames may stop resolving while VPN is disconnected; that is preferable to silently sending them to a public resolver. The address is a session snapshot: if later authorization advertises a different DNS, regenerate the fragment as a separate environment update.
+
+Check existing merge semantics and mihomo modes before applying: the list form assumes blacklist Fake IP filtering; rule/whitelist configurations need their corresponding syntax. If `direct-nameserver` is configured, verify `direct-nameserver-follow-policy`; otherwise direct re-resolution may ignore the intended policy. Preserve ordinary DNS defaults and validate existing school-domain/IP `DIRECT` routing rules independently. These settings are described in the [official mihomo DNS reference](https://wiki.metacubex.one/en/config/dns/); the generator never adjusts global behavior to force a match.
+
+Offline test daemons never perform DNS, route or HTTP probes. Their reports explicitly say `offline_test`/`simulated` and cannot generate production DNS overrides. Use a native connection for real diagnosis.
+
 ## Machine output
 
 Use global `--json` to emit one JSON response on standard output. Diagnostics go to standard error. Responses contain `ok`, `code`, `message`, and `data`. Status data separately identifies the service and VPN connection state. A running service does not imply a connected VPN.
