@@ -18,6 +18,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[ignore = "requires live campus credentials/network"]
     async fn test() {
         diag::try_init_tracing("info");
         let _ = start_service("", "").await;
