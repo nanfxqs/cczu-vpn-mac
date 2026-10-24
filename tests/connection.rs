@@ -74,6 +74,60 @@ impl Fixture {
             serde_json::from_slice(&output.stdout).unwrap(),
         )
     }
+    fn pending(&self, args: &[&str]) -> Pending {
+        Pending(Some(
+            Command::new(env!("CARGO_BIN_EXE_cczu-vpn-proto"))
+                .args(["--json", "--socket", self.socket.to_str().unwrap()])
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        ))
+    }
+    fn credentials(&self) {
+        assert_eq!(
+            self.call(
+                &["credentials", "set", "--stdin", "--save"],
+                Some(json!({"user":"campus","password":"not-logged"}))
+            )
+            .0,
+            0
+        );
+    }
+    fn wait_for(&self, connection: &str) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let (_, status) = self.call(&["status"], None);
+            if status["data"]["connection"] == connection {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Expected {connection}, received {status}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+struct Pending(Option<Child>);
+impl Pending {
+    fn finish(mut self) -> (i32, Value) {
+        let output = self.0.take().unwrap().wait_with_output().unwrap();
+        (
+            output.status.code().unwrap(),
+            serde_json::from_slice(&output.stdout).unwrap(),
+        )
+    }
+}
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -178,4 +232,74 @@ fn broader_campus_route_preserves_a_more_specific_local_network() {
             .contains(&json!("172.16.0.0/12"))
     );
     assert_eq!(fixture.call(&["disconnect"], None).0, 0);
+}
+
+#[test]
+fn disconnect_cancels_all_waiters_and_startup_cannot_publish_late_success() {
+    let fixture = Fixture::start("slow-ready");
+    fixture.credentials();
+    let first = fixture.pending(&["connect"]);
+    fixture.wait_for("connecting");
+    let second = fixture.pending(&["connect"]);
+    thread::sleep(Duration::from_millis(60));
+    let started = Instant::now();
+    assert_eq!(fixture.call(&["disconnect"], None).0, 0);
+    assert!(
+        started.elapsed() < Duration::from_millis(600),
+        "disconnect must cancel rather than wait for slow startup"
+    );
+    for pending in [first, second] {
+        let (code, result) = pending.finish();
+        assert_eq!(code, 5);
+        assert_eq!(result["code"], "connection_cancelled");
+    }
+    thread::sleep(Duration::from_millis(2100));
+    assert_eq!(
+        fixture.call(&["status"], None).1["data"]["connection"],
+        "disconnected"
+    );
+}
+
+#[test]
+fn startup_deadline_cleans_up_and_preserves_a_machine_readable_timeout() {
+    let fixture = Fixture::start("startup-timeout");
+    fixture.credentials();
+    let started = Instant::now();
+    let (code, result) = fixture.call(&["connect"], None);
+    assert_eq!(code, 5);
+    assert_eq!(result["code"], "connection_timeout");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let failed = fixture.wait_for("failed");
+    assert!(
+        failed["data"]["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("timed out")
+    );
+    assert_eq!(fixture.call(&["disconnect"], None).0, 0);
+}
+
+#[test]
+fn forwarding_failure_is_cleaned_without_polling_and_does_not_auto_reconnect() {
+    let fixture = Fixture::start("forward-failure");
+    fixture.credentials();
+    assert_eq!(fixture.call(&["connect"], None).0, 0);
+    thread::sleep(Duration::from_millis(500));
+    let failed = fixture.call(&["status"], None).1;
+    assert_eq!(failed["data"]["connection"], "failed");
+    assert!(
+        failed["data"]["last_error"]
+            .as_str()
+            .unwrap()
+            .contains("EOF")
+    );
+    assert_eq!(failed["data"]["generation"], 1);
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(fixture.call(&["status"], None).1["data"]["generation"], 1);
+    assert_eq!(fixture.call(&["disconnect"], None).0, 0);
+    assert_eq!(
+        fixture.call(&["status"], None).1["data"]["last_error"],
+        failed["data"]["last_error"]
+    );
+    assert_eq!(fixture.call(&["connect"], None).1["data"]["generation"], 2);
 }

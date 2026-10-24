@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub mod connection;
+pub mod control;
 pub mod credentials;
 mod install;
 pub mod network;
@@ -102,7 +103,7 @@ pub enum ServiceAction {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Response {
     pub ok: bool,
     pub code: String,

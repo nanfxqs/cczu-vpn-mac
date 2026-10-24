@@ -14,6 +14,9 @@ use tun_rs::{DeviceBuilder, SyncDevice};
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum TestScenario {
+    SlowReady,
+    StartupTimeout,
+    ForwardFailure,
     Disabled,
     Ready,
     SetupFailure,
@@ -65,6 +68,7 @@ impl ConnectionManager {
             Some(scenario) => ActiveConnection::Offline {
                 scenario,
                 info: None,
+                connected_at: None,
             },
             None => ActiveConnection::Native(Box::default()),
         };
@@ -92,8 +96,45 @@ impl ConnectionManager {
         self.active = None;
         Ok(())
     }
+    pub fn startup_timeout(&self) -> Duration {
+        if matches!(self.scenario, Some(TestScenario::StartupTimeout)) {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(60)
+        }
+    }
     pub fn forwarding_failed(&self) -> bool {
-        matches!(&self.active, Some(ActiveConnection::Native(connection)) if connection.forward.as_ref().is_some_and(JoinHandle::is_finished))
+        match &self.active {
+            Some(ActiveConnection::Native(connection)) => connection
+                .forward
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished),
+            Some(ActiveConnection::Offline {
+                scenario: TestScenario::ForwardFailure,
+                connected_at: Some(time),
+                ..
+            }) => time.elapsed() >= Duration::from_millis(200),
+            _ => false,
+        }
+    }
+    pub async fn forwarding_error(&mut self) -> Option<String> {
+        if !self.forwarding_failed() {
+            return None;
+        }
+        match self.active.as_mut() {
+            Some(ActiveConnection::Native(connection)) => {
+                let task = connection.forward.take()?;
+                Some(match task.await {
+                    Ok(Err(error)) => error.to_string(),
+                    Ok(Ok(())) => "VPN packet forwarding stopped".into(),
+                    Err(_) => "VPN packet forwarding task stopped unexpectedly".into(),
+                })
+            }
+            Some(ActiveConnection::Offline { .. }) => {
+                Some("Offline backend simulated proxy EOF".into())
+            }
+            None => None,
+        }
     }
 }
 
@@ -102,6 +143,7 @@ enum ActiveConnection {
     Offline {
         scenario: TestScenario,
         info: Option<ConnectionInfo>,
+        connected_at: Option<Instant>,
     },
 }
 
@@ -115,8 +157,20 @@ impl ActiveConnection {
     async fn start(&mut self, credentials: Credentials) -> Result<ConnectionInfo> {
         match self {
             Self::Native(connection) => connection.start(credentials).await,
-            Self::Offline { scenario, info } => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            Self::Offline {
+                scenario,
+                info,
+                connected_at,
+            } => {
+                if matches!(scenario, TestScenario::StartupTimeout) {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(if matches!(scenario, TestScenario::SlowReady) {
+                    Duration::from_secs(2)
+                } else {
+                    Duration::from_millis(100)
+                })
+                .await;
                 ensure!(
                     !matches!(scenario, TestScenario::SetupFailure),
                     "Offline backend injected a network setup failure"
@@ -163,6 +217,7 @@ impl ActiveConnection {
                     backend: "offline".into(),
                 };
                 *info = Some(ready.clone());
+                *connected_at = Some(Instant::now());
                 Ok(ready)
             }
         }
@@ -170,8 +225,11 @@ impl ActiveConnection {
     async fn stop(&mut self) -> Result<()> {
         match self {
             Self::Native(connection) => connection.stop().await,
-            Self::Offline { info, .. } => {
+            Self::Offline {
+                info, connected_at, ..
+            } => {
                 *info = None;
+                *connected_at = None;
                 Ok(())
             }
         }

@@ -18,6 +18,7 @@ use tokio::{
 use super::{
     Response, SOCKET,
     connection::{ConnectionInfo, ConnectionManager, TestScenario},
+    control::ConnectionControl,
     credentials::{self, CredentialStore, Credentials},
 };
 
@@ -47,6 +48,7 @@ pub enum Request {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Status {
+    pub generation: u64,
     pub service: String,
     pub connection: String,
     pub last_error: Option<String>,
@@ -54,22 +56,24 @@ pub struct Status {
 }
 
 pub struct DaemonState {
-    pub status: Mutex<Status>,
+    pub status: Arc<Mutex<Status>>,
     pub credentials: Mutex<CredentialStore>,
-    pub connection: Mutex<ConnectionManager>,
+    pub connection: ConnectionControl,
 }
 
 impl DaemonState {
     fn new(directory: PathBuf, scenario: Option<TestScenario>) -> Self {
+        let status = Arc::new(Mutex::new(Status {
+            generation: 0,
+            service: "running".into(),
+            connection: "disconnected".into(),
+            last_error: None,
+            connection_info: None,
+        }));
         Self {
             credentials: Mutex::new(CredentialStore::new(directory)),
-            connection: Mutex::new(ConnectionManager::new(scenario)),
-            status: Mutex::new(Status {
-                service: "running".into(),
-                connection: "disconnected".into(),
-                last_error: None,
-                connection_info: None,
-            }),
+            connection: ConnectionControl::new(ConnectionManager::new(scenario), status.clone()),
+            status,
         }
     }
 }
@@ -81,7 +85,7 @@ pub fn effective_uid() -> u32 {
 
 pub async fn request(socket: &Path, request: &Request) -> Response {
     let response_timeout = if matches!(request, Request::Connect { .. } | Request::Disconnect) {
-        Duration::from_secs(90)
+        Duration::from_secs(100)
     } else {
         CONTROL_TIMEOUT
     };
@@ -133,75 +137,26 @@ async fn serve_client(stream: UnixStream, state: Arc<DaemonState>) -> Result<()>
                 credentials,
                 ignore_saved,
             }) => {
-                let resolved = state
-                    .credentials
-                    .lock()
-                    .await
-                    .resolve(credentials, ignore_saved);
-                match resolved {
-                    Ok(Some(credentials)) => {
-                        let mut connection = state.connection.lock().await;
-                        state.status.lock().await.connection = "connecting".into();
-                        match connection.connect(credentials).await {
-                            Ok(info) => {
-                                let mut status = state.status.lock().await;
-                                status.connection = "connected".into();
-                                status.last_error = None;
-                                status.connection_info = Some(info);
-                                Response::success(status.clone())
-                            }
-                            Err(err) => {
-                                let mut status = state.status.lock().await;
-                                status.connection = "failed".into();
-                                status.connection_info = None;
-                                status.last_error = Some(err.to_string());
-                                Response::error("connection_failed", err.to_string())
-                            }
-                        }
-                    }
-                    Ok(None) => Response::error(
-                        "credentials_required",
-                        "Provide campus credentials before connecting",
-                    ),
-                    Err(_) => Response::error(
-                        "credential_store_error",
-                        "Could not read campus credentials",
-                    ),
-                }
-            }
-            Ok(Request::Disconnect) => {
-                let mut connection = state.connection.lock().await;
-                state.status.lock().await.connection = "disconnecting".into();
-                match connection.disconnect().await {
-                    Ok(()) => {
-                        let mut status = state.status.lock().await;
-                        status.connection = "disconnected".into();
-                        status.connection_info = None;
-                        Response::success(status.clone())
-                    }
-                    Err(err) => {
-                        let mut status = state.status.lock().await;
-                        status.connection = "failed".into();
-                        status.last_error = Some(err.to_string());
-                        Response::error("disconnect_failed", err.to_string())
+                let phase = state.status.lock().await.connection.clone();
+                if matches!(phase.as_str(), "connected" | "connecting") {
+                    state.connection.connect(None).await
+                } else {
+                    let resolved = state
+                        .credentials
+                        .lock()
+                        .await
+                        .resolve(credentials, ignore_saved);
+                    match resolved {
+                        Ok(credentials) => state.connection.connect(credentials).await,
+                        Err(_) => Response::error(
+                            "credential_store_error",
+                            "Could not read campus credentials",
+                        ),
                     }
                 }
             }
-            Ok(Request::Status) => {
-                if let Ok(mut connection) = state.connection.try_lock()
-                    && connection.forwarding_failed()
-                {
-                    let cleanup = connection.disconnect().await;
-                    let mut status = state.status.lock().await;
-                    status.connection = "failed".into();
-                    status.last_error = Some(match cleanup {
-                        Ok(()) => "VPN packet forwarding stopped; connection cleaned up".into(),
-                        Err(error) => format!("VPN packet forwarding stopped; {error}"),
-                    });
-                    status.connection_info = None;
-                }
-                Response::success(state.status.lock().await.clone())
-            }
+            Ok(Request::Disconnect) => state.connection.disconnect().await,
+            Ok(Request::Status) => Response::success(state.status.lock().await.clone()),
             Ok(Request::CredentialsSet { credentials, save }) => {
                 state.credentials.lock().await.set(credentials, save)
             }
@@ -307,6 +262,7 @@ pub async fn run_daemon(test_socket: Option<PathBuf>, test_scenario: TestScenari
             _ = hangup.recv() => {},
         }
     }
-    state.connection.lock().await.disconnect().await?;
+    let shutdown = state.connection.shutdown().await;
+    ensure!(shutdown.ok, "{}", shutdown.message);
     Ok(())
 }
