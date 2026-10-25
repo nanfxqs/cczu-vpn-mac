@@ -12,9 +12,9 @@ cd "$repo_root"
 
 origin_url="$(git remote get-url origin 2>/dev/null)" ||
   die "origin remote is not configured"
-origin_ssh_url="git@github.com:nanfxqs/cczu-vpn.git"
+origin_ssh_url="git@github.com:nanfxqs/cczu-vpn-mac.git"
 case "$origin_url" in
-  https://github.com/nanfxqs/cczu-vpn.git | "$origin_ssh_url")
+  https://github.com/nanfxqs/cczu-vpn-mac.git | "$origin_ssh_url")
     ;;
   *)
     die "origin points to unexpected repository: $origin_url"

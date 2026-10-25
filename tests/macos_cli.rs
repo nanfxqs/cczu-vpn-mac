@@ -119,6 +119,12 @@ fn installation_can_be_staged_repeatedly_and_uninstalled_without_launchd() {
         let value: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["data"]["staged"], true);
     }
+    for name in ["cczu-vpn", "cczu-vpn-proto"] {
+        assert_eq!(
+            fs::read_link(dir.join("usr/local/bin").join(name)).unwrap(),
+            PathBuf::from("/usr/local/libexec/cczu-vpn-proto")
+        );
+    }
     let plist = fs::read_to_string(dir.join("Library/LaunchDaemons/edu.cczu.vpn.plist")).unwrap();
     assert!(plist.contains("<string>/usr/local/libexec/cczu-vpn-proto</string>"));
     assert!(plist.contains("<key>RunAtLoad</key><true/>"));
@@ -153,5 +159,8 @@ fn installation_can_be_staged_repeatedly_and_uninstalled_without_launchd() {
         !dir.join("Library/LaunchDaemons/edu.cczu.vpn.plist")
             .exists()
     );
+    for name in ["cczu-vpn", "cczu-vpn-proto"] {
+        assert!(fs::symlink_metadata(dir.join("usr/local/bin").join(name)).is_err());
+    }
     fs::remove_dir_all(dir).unwrap();
 }

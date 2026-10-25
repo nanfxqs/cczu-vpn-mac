@@ -208,6 +208,49 @@ fn failed_setup_rolls_back_and_temporary_credentials_do_not_persist() {
 }
 
 #[test]
+fn short_commands_default_to_json_and_share_the_existing_service() {
+    let fixture = Fixture::start("ready");
+    fixture.credentials();
+    let short = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_cczu-vpn"))
+            .args(["--socket", fixture.socket.to_str().unwrap()])
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(
+            output
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .count(),
+            1,
+            "Short commands must emit one compact JSON response"
+        );
+        (output.status.code().unwrap(), value)
+    };
+    let (exit, status) = short(&["status"]);
+    assert_eq!(exit, 0);
+    assert_eq!(status["ok"], true);
+    assert_eq!(status["data"]["connection"], "disconnected");
+    let (exit, ready) = short(&["on"]);
+    assert_eq!(exit, 0, "{ready}");
+    assert_eq!(ready["data"]["connection"], "connected");
+    let compatible = fixture.call(&["connect"], None).1;
+    assert_eq!(
+        compatible["data"]["generation"],
+        ready["data"]["generation"]
+    );
+    let (exit, stopped) = short(&["off"]);
+    assert_eq!(exit, 0);
+    assert_eq!(stopped["data"]["connection"], "disconnected");
+    let (exit, error) = short(&["not-a-command"]);
+    assert_eq!(exit, 2);
+    assert_eq!(error["code"], "invalid_arguments");
+}
+
+#[test]
 fn network_failure_reports_stage_and_cause_in_connect_and_status() {
     let fixture = Fixture::start("network-detail");
     let (exit, failed) = fixture.call(

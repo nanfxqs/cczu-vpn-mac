@@ -1,24 +1,35 @@
 # macOS CLI
 
+```sh
+cczu-vpn on          # Connect using saved credentials
+cczu-vpn off         # Disconnect and clean owned routes
+cczu-vpn status      # Query service and connection state
+cczu-vpn doctor      # Diagnose routing, DNS and campus HTTP access
+cczu-vpn help        # List commands
+cczu-vpn on --help   # Show connection options
+```
+
+The short entrypoint emits compact JSON by default, so agents need no output-format flag. `help`, `--help`, `-h` and subcommand help print readable usage. The `connect`/`disconnect` aliases and `cczu-vpn-proto --json` calls remain compatible.
+
 ## Connect and disconnect
 
 After installation and credential initialization, daily operations do not require sudo:
 
 ```sh
-cczu-vpn-proto --json connect
-cczu-vpn-proto --json status
-cczu-vpn-proto --json disconnect
+cczu-vpn on
+cczu-vpn status
+cczu-vpn off
 ```
 
-`connect` returns success only after authentication, tunnel creation, campus routes and packet forwarding are ready. It does not treat a started process as a connected VPN. Status includes a `connection_info` snapshot with the allocated utun interface, tunnel address/mask/gateway, advertised DNS, actual tunnel peer and campus prefixes; it never includes the password. Website availability is a separate diagnostic from tunnel readiness.
+`on` returns success only after authentication, tunnel creation, campus routes and packet forwarding are ready. It does not treat a started process as a connected VPN. Status includes a `connection_info` snapshot with the allocated utun interface, tunnel address/mask/gateway, advertised DNS, actual tunnel peer and campus prefixes; it never includes the password. Website availability is a separate diagnostic from tunnel readiness.
 
-Concurrent `connect` calls share the current attempt; status `generation` increments only when a new attempt starts. Repeating connect for an already connected VPN succeeds without re-reading credentials. `disconnect` cancels startup, waits for owned-resource cleanup, and prevents late startup success. While disconnecting, a new connect returns `operation_in_progress` so the caller can retry after cleanup. Duplicate disconnects are safe.
+Concurrent `on` calls share the current attempt; status `generation` increments only when a new attempt starts. Repeating connect for an already connected VPN succeeds without re-reading credentials. `off` cancels startup, waits for owned-resource cleanup, and prevents late startup success. While disconnecting, a new connect returns `operation_in_progress` so the caller can retry after cleanup. Duplicate disconnects are safe.
 
 Startup has a 60-second deadline, followed by at most 30 seconds of cleanup per attempt. Cancellation reports `connection_cancelled`; startup expiry reports `connection_timeout`. If cleanup cannot establish ownership or finish, status remains failed with a retryable reason and the journal is retained; do not treat an error response as proof that all network resources were removed. Control requests have bounded client waits; query status before retrying after `operation_timeout`.
 
 The background service monitors packet-forwarding completion and cleans failed connections without requiring a status query. It preserves the last failure across status queries and explicit disconnect, clears it after a successful connection, and never automatically reconnects. Idle traffic alone is not a failure signal: the upstream protocol sends heartbeats but does not define a verified acknowledgement deadline.
 
-For a one-off account, pass a JSON object containing `user` and `password` to `connect --stdin --ignore-saved` on standard input. This does not save that account. Avoid putting secrets in command arguments or shell history. Missing credentials produce `credentials_required` rather than an interactive prompt.
+For a one-off account, pass a JSON object containing `user` and `password` to `on --stdin --ignore-saved` on standard input. This does not save that account. Avoid putting secrets in command arguments or shell history. Missing credentials produce `credentials_required` rather than an interactive prompt.
 
 The native runtime allocates a new utun without selecting another process's interface. It forwards raw IP packets in both directions, preserves TLS verification, and installs only checked campus IPv4 routes plus exact school endpoint protections. The physical gateway/interface are discovered at connection time. Default/broad takeover routes, overlapping local networks, malformed masks and conflicting exact routes fail explicitly. Gateway Fake IP responses also fail with an instruction to check DNS/Fake IP configuration. Existing matching routes are not adopted for cleanup. Successful adds are removed in reverse order only while their prefix/interface/gateway still match.
 
@@ -35,18 +46,27 @@ The macOS entrypoint controls a system VPN service. Windows and Linux retain the
 Build with `cargo build --release --locked`, then install once:
 
 ```sh
-sudo ./target/release/cczu-vpn-proto service install
-cczu-vpn-proto --json status
+sudo ./target/release/cczu-vpn service install
+cczu-vpn status
 ```
 
-Installation copies the executable into `/usr/local/libexec/cczu-vpn-proto`, creates a launchd definition, and installs a CLI link in `/usr/local/bin`. Repeating installation updates only this service. It does not start a VPN connection. Service management follows Apple's [launchd lifecycle](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html).
+Installation copies the executable into `/usr/local/libexec/cczu-vpn-proto`, creates a launchd definition, and installs both `cczu-vpn` and the legacy `cczu-vpn-proto` links in `/usr/local/bin`. Repeating installation updates only this service. It does not start a VPN connection. Service management follows Apple's [launchd lifecycle](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html).
+
+If the background service is already installed, the short client can also be installed for the current user without updating the privileged service:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+install -m 755 target/release/cczu-vpn "$HOME/.local/bin/cczu-vpn"
+```
+
+Use this location when `$HOME/.local/bin` is in the user's `PATH`. The client communicates with the existing local service and reuses its saved credentials.
 
 The background service is independent of SSH sessions. Its local Unix socket accepts this tool's commands without per-user authorization configuration. There is no network listener or arbitrary privileged-command interface. As requested for this personal machine, any local user can control VPN operations. The daemon owns privileged network configuration; daily status and VPN commands do not need sudo.
 
 ```sh
-sudo cczu-vpn-proto service stop
-sudo cczu-vpn-proto service install  # start again
-sudo cczu-vpn-proto service uninstall
+sudo cczu-vpn service stop
+sudo cczu-vpn service install  # start again
+sudo cczu-vpn service uninstall
 ```
 
 `service stop` unloads the service, so launchd will not immediately restart it. The next machine boot loads the installed service again. Uninstall removes only this tool's service definition, binary and CLI link; stored credentials are handled separately.
@@ -55,26 +75,26 @@ sudo cczu-vpn-proto service uninstall
 
 Credentials belong to the background service, not the user who ran `sudo` during installation. Production stores one shared plaintext account/password file in `/var/db/cczu-vpn/credentials.json`, owned by root with mode `0600` inside a `0700` directory. Daily management goes through the local service and needs no sudo. It does not use the login keychain or require a graphical session.
 
-For interactive initialization, run `cczu-vpn-proto credentials set` in a terminal. The password input is hidden. The command asks whether to save; answering no keeps the credentials only in daemon memory. `--save` explicitly chooses persistence. The CLI does not claim to have authenticated the credentials; the connection command validates them against the school service.
+For interactive initialization, run `cczu-vpn credentials set` in a terminal. The password input is hidden. The command asks whether to save; answering no keeps the credentials only in daemon memory. `--save` explicitly chooses persistence. The CLI does not claim to have authenticated the credentials; the connection command validates them against the school service.
 
 Agents should send a JSON object with `user` and `password` through standard input, rather than supplying passwords as command arguments:
 
 ```sh
-your-secret-source | cczu-vpn-proto --json credentials set --stdin --save
-cczu-vpn-proto --json credentials status
-cczu-vpn-proto --json credentials status --ignore-saved
-cczu-vpn-proto --json credentials delete
+your-secret-source | cczu-vpn credentials set --stdin --save
+cczu-vpn credentials status
+cczu-vpn credentials status --ignore-saved
+cczu-vpn credentials delete
 ```
 
 Omit `--save` to use temporary credentials until the background service restarts or they are replaced/deleted. Temporary credentials take priority over the saved file; saving a new account clears the temporary override. Ignoring saved credentials does not remove them and still permits temporary credentials. Status reports only presence (`configured`, `saved`, `temporary`), never the stored account or password. Delete clears both temporary and persisted credentials and is safe to repeat.
 
-JSON-mode and non-terminal initialization never prompt. Missing input returns `credentials_required`, malformed or empty JSON credentials return `invalid_credentials`, and storage failures return `credential_store_error`; each uses operation-failed exit code `5`. Initialization does not save unless explicitly selected. Secrets must come from a source controlled by the caller; do not embed real passwords in shell history, logs or example commands.
+Explicit `--json` and non-terminal initialization never prompt. Missing input returns `credentials_required`, malformed or empty JSON credentials return `invalid_credentials`, and storage failures return `credential_store_error`; each uses operation-failed exit code `5`. Initialization does not save unless explicitly selected. Secrets must come from a source controlled by the caller; do not embed real passwords in shell history, logs or example commands.
 
 ## Read-only diagnosis and campus DNS preparation
 
 ```sh
-cczu-vpn-proto --json doctor
-cczu-vpn-proto --json doctor --domain YOUR-INTERNAL-HOST.cczu.edu.cn
+cczu-vpn doctor
+cczu-vpn doctor --domain YOUR-INTERNAL-HOST.cczu.edu.cn
 ```
 
 Replace the example with an actual lowercase campus hostname. The current acceptance resource is an IP address, so domain-specific DNS preparation is optional until a domain that needs internal resolution is identified. `doctor` does not change routes, DNS settings, mihomo configuration or school business data. It reports service availability, whether credentials are configured, connection state, the route to `172.22.226.31`, public VPN authentication hostname resolution, and a bounded direct TCP HTTP `HEAD /` probe to the known resource. It does not send credentials to the website, read its body, follow redirects or perform login operations. Its HTTP probe bypasses HTTP proxy environment settings; application/mihomo proxy rules need separate verification.
@@ -86,11 +106,11 @@ When exact campus hostnames are supplied, native diagnostics compare system reso
 After a native VPN connection is active, obtain a one-time **merge fragment** using the actual DNS address from authorization:
 
 ```sh
-cczu-vpn-proto --json doctor --dns-override --domain actual-internal-host.cczu.edu.cn \
+cczu-vpn doctor --dns-override --domain actual-internal-host.cczu.edu.cn \
   | jq -r '.data.yaml // empty' > campus-dns-override.yaml
 ```
 
-The command returns YAML in `data.yaml` with `applied: false`; it does not write or reload mihomo. It refuses disconnected sessions, offline fixture DNS, unsupported DNS addresses, the root school suffix and the VPN authentication hostname. Merge the fragment's entries into the existing override during environment preparation, keeping existing configuration. Subsequent `connect`/`disconnect` operations never reconfigure mihomo.
+The command returns YAML in `data.yaml` with `applied: false`; it does not write or reload mihomo. It refuses disconnected sessions, offline fixture DNS, unsupported DNS addresses, the root school suffix and the VPN authentication hostname. Merge the fragment's entries into the existing override during environment preparation, keeping existing configuration. Subsequent `on`/`off` operations never reconfigure mihomo.
 
 The fragment retains `+.cczu.edu.cn` in the Fake IP exclusion list and maps only the explicitly selected exact hostnames to the advertised DNS using `#DIRECT`. It does not change the public authentication hostname's resolver, so adding an internal-only DNS does not create a VPN bootstrap dependency. Selected internal hostnames may stop resolving while VPN is disconnected; that is preferable to silently sending them to a public resolver. The address is a session snapshot: if later authorization advertises a different DNS, regenerate the fragment as a separate environment update.
 
@@ -100,7 +120,7 @@ Offline test daemons never perform DNS, route or HTTP probes. Their reports expl
 
 ## Machine output
 
-Use global `--json` to emit one JSON response on standard output. Diagnostics go to standard error. Responses contain `ok`, `code`, `message`, and `data`. Status data separately identifies the service and VPN connection state. A running service does not imply a connected VPN.
+`cczu-vpn` emits one compact JSON response on standard output by default. The legacy entrypoint also accepts global `--json`. Help remains readable text; interactive credential setup uses the terminal. Diagnostics go to standard error. Responses contain `ok`, `code`, `message`, and `data`. Status data separately identifies the service and VPN connection state. A running service does not imply a connected VPN.
 
 Exit codes:
 
@@ -124,7 +144,7 @@ The daemon persists a private route intent journal at `/var/db/cczu-vpn/network-
 
 Existing routes are never adopted. Changed routes are retained and reported as an incomplete recovery; new connections remain blocked until cleanup can finish. Interrupted physical endpoint host-route additions can be reconciled from the same-boot write-ahead record when the current prefix, interface, gateway and ownership marker match. Routes attributed to another boot and a surviving recovered utun whose ownership cannot be proven remain untouched. An old utun name alone is insufficient because macOS can reuse it. Missing routes are reconciled without deleting another prefix. The offline backend exercises this same journal and cleanup algorithm using an isolated persisted route table; its owner token models provable resource identity and does not claim a native macOS interface has that token.
 
-Installation records the identity of its executable in `/var/db/cczu-vpn/install.json`; install/uninstall refuse to overwrite or delete a replaced executable or changed service definition. Stop, reinstall and uninstall also reconcile owned network resources after the service exits. Uninstall retains saved campus credentials by default. To remove them, run `cczu-vpn-proto --json credentials delete` while the service is running before uninstalling. Neither cleanup nor removal changes mihomo configuration.
+Installation records the identity of its executable in `/var/db/cczu-vpn/install.json`; install/uninstall refuse to overwrite or delete a replaced executable or changed service definition. Stop, reinstall and uninstall also reconcile owned network resources after the service exits. Uninstall retains saved campus credentials by default. To remove them, run `cczu-vpn credentials delete` while the service is running before uninstalling. Neither cleanup nor removal changes mihomo configuration.
 
 Startup failures expose a stable category in the response `code` and in status
 `last_error_code`, alongside the sanitized human-readable `last_error`. Categories

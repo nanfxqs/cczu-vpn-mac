@@ -16,14 +16,14 @@ pub const SOCKET: &str = "/var/run/cczu-vpn/control.sock";
 
 #[derive(Parser)]
 #[command(
-    name = "cczu-vpn-proto",
+    name = "cczu-vpn",
     about = "Control the macOS CCZU VPN background service"
 )]
 pub struct Args {
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "Emit compact JSON (default for cczu-vpn)")]
     pub json: bool,
     /// Select an isolated local service socket (primarily for development).
-    #[arg(long, global = true, default_value = SOCKET)]
+    #[arg(long, global = true, default_value = SOCKET, hide = true)]
     pub socket: PathBuf,
     #[command(subcommand)]
     pub command: Command,
@@ -32,6 +32,7 @@ pub struct Args {
 #[derive(Subcommand)]
 pub enum Command {
     /// Inspect service, routing, DNS and the known campus HTTP resource.
+    #[command(display_order = 4)]
     Doctor {
         /// Generate a one-time mihomo DNS fragment from the active native session.
         #[arg(long)]
@@ -41,6 +42,7 @@ pub enum Command {
         domains: Vec<String>,
     },
     /// Establish a campus VPN and wait until its network configuration is ready.
+    #[command(name = "on", visible_alias = "connect", display_order = 1)]
     Connect {
         #[arg(long)]
         stdin: bool,
@@ -48,15 +50,19 @@ pub enum Command {
         ignore_saved: bool,
     },
     /// Disconnect the campus VPN while keeping the control service running.
+    #[command(name = "off", visible_alias = "disconnect", display_order = 2)]
     Disconnect,
     /// Manage shared campus credentials without a desktop keychain.
+    #[command(display_order = 5)]
     Credentials {
         #[command(subcommand)]
         action: CredentialAction,
     },
     /// Query background service and VPN connection separately.
+    #[command(display_order = 3)]
     Status,
     /// Run the privileged system service (normally launched by launchd).
+    #[command(hide = true)]
     Daemon {
         /// Isolated unprivileged service for offline development only.
         #[arg(long, hide = true)]
@@ -70,6 +76,7 @@ pub enum Command {
         test_scenario: connection::TestScenario,
     },
     /// Install, stop or remove the system service (requires administrator privileges).
+    #[command(display_order = 6)]
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -151,10 +158,22 @@ impl Response {
 }
 
 pub async fn run() -> i32 {
+    let executable = std::env::args_os().next().map(PathBuf::from);
+    let default_json = match executable
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+    {
+        Some("cczu-vpn") => true,
+        Some("cczu-vpn-proto") => false,
+        _ => env!("CARGO_BIN_NAME") == "cczu-vpn",
+    };
     let args = match Args::try_parse() {
         Ok(args) => args,
         Err(error) => {
-            if error.use_stderr() && std::env::args_os().any(|arg| arg == "--json") {
+            if error.use_stderr()
+                && (default_json || std::env::args_os().any(|arg| arg == "--json"))
+            {
                 let response = Response::error(
                     "invalid_arguments",
                     "Invalid command or arguments; use --help",
@@ -170,6 +189,7 @@ pub async fn run() -> i32 {
             return code;
         }
     };
+    let json_mode = args.json || default_json;
     let response = match args.command {
         Command::Doctor {
             domains,
@@ -201,7 +221,7 @@ pub async fn run() -> i32 {
                             "invalid_credentials",
                             "Expected campus user and password JSON on standard input",
                         );
-                        return print_response(&response, args.json);
+                        return print_response(&response, json_mode);
                     }
                 }
             } else {
@@ -259,7 +279,7 @@ pub async fn run() -> i32 {
         },
         Command::Service { action } => install::execute(action),
     };
-    print_response(&response, args.json)
+    print_response(&response, json_mode)
 }
 
 fn print_response(response: &Response, json_mode: bool) -> i32 {

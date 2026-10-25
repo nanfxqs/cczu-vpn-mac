@@ -87,6 +87,8 @@ jobs:
             "$release_dir/libcczuvpnproto.dylib" \
             "$release_dir/cczuvpnproto.dll" \
             "$release_dir/cczuvpnproto.lib" \
+            "$release_dir/cczu-vpn" \
+            "$release_dir/cczu-vpn.exe" \
             "$release_dir/cczu-vpn-proto" \
             "$release_dir/cczu-vpn-proto.exe"
           do

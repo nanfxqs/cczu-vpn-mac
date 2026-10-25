@@ -12,6 +12,8 @@ Open-source Rust reimplementation of the CCZU WebVPN tunnel client.
 
 This macOS repository adds an agent-facing CLI and a launchd background service. See the [macOS installation and usage guide](docs/macos-cli.md) for installation, credentials, connection control and diagnostics.
 
+Daily commands: `cczu-vpn on`, `cczu-vpn off`, `cczu-vpn status`, and `cczu-vpn help`. The short CLI outputs JSON by default.
+
 The project currently provides both:
 
 - a Windows-oriented CLI client path for direct usage

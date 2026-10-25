@@ -16,7 +16,7 @@ use super::{
 
 const LABEL: &str = "edu.cczu.vpn";
 const BINARY: &str = "/usr/local/libexec/cczu-vpn-proto";
-const CLI_LINK: &str = "/usr/local/bin/cczu-vpn-proto";
+const CLI_LINKS: [&str; 2] = ["/usr/local/bin/cczu-vpn", "/usr/local/bin/cczu-vpn-proto"];
 const PLIST: &str = "/Library/LaunchDaemons/edu.cczu.vpn.plist";
 
 fn location(staging: Option<&Path>, path: &str) -> PathBuf {
@@ -156,12 +156,14 @@ fn validate_existing(staging: Option<&Path>) -> Result<bool> {
         );
         owned_plist = true;
     }
-    let link = location(staging, CLI_LINK);
-    if let Ok(meta) = fs::symlink_metadata(&link) {
-        ensure!(
-            meta.file_type().is_symlink() && fs::read_link(&link)? == Path::new(BINARY),
-            "Unrelated CLI path left untouched"
-        );
+    for name in CLI_LINKS {
+        let link = location(staging, name);
+        if let Ok(meta) = fs::symlink_metadata(&link) {
+            ensure!(
+                meta.file_type().is_symlink() && fs::read_link(&link)? == Path::new(BINARY),
+                "Unrelated CLI path left untouched"
+            );
+        }
     }
     Ok(identity.is_some() && owned_plist)
 }
@@ -204,15 +206,8 @@ fn install(staging: Option<&Path>) -> Result<()> {
     }
     recover(staging)?;
     let binary = location(staging, BINARY);
-    let link = location(staging, CLI_LINK);
+    let link = location(staging, CLI_LINKS[0]);
     directory(link.parent().context("Missing CLI directory")?)?;
-    if let Ok(meta) = fs::symlink_metadata(&link) {
-        ensure!(
-            meta.file_type().is_symlink() && fs::read_link(&link)? == Path::new(BINARY),
-            "Refusing to replace unrelated CLI path: {}",
-            link.display()
-        );
-    }
     write_atomic(&binary, &fs::read(std::env::current_exe()?)?, 0o755)?;
     directory(
         location(staging, DATA_DIR)
@@ -224,8 +219,11 @@ fn install(staging: Option<&Path>) -> Result<()> {
         &binary_identity(&binary)?,
     )?;
     write_atomic(&location(staging, PLIST), definition().as_bytes(), 0o644)?;
-    if fs::symlink_metadata(&link).is_err() {
-        symlink(BINARY, &link)?;
+    for name in CLI_LINKS {
+        let link = location(staging, name);
+        if fs::symlink_metadata(&link).is_err() {
+            symlink(BINARY, &link)?;
+        }
     }
     if staging.is_none() {
         launchctl(&["enable", &format!("system/{LABEL}")])?;
@@ -247,13 +245,15 @@ fn uninstall(staging: Option<&Path>) -> Result<()> {
             "Service definition differs from this tool's definition; refusing to remove unrelated configuration"
         );
     }
-    let link = location(staging, CLI_LINK);
-    if let Ok(meta) = fs::symlink_metadata(&link) {
-        ensure!(
-            meta.file_type().is_symlink() && fs::read_link(&link)? == Path::new(BINARY),
-            "Refusing to remove unrelated CLI path"
-        );
-        fs::remove_file(link)?;
+    for name in CLI_LINKS {
+        let link = location(staging, name);
+        if let Ok(meta) = fs::symlink_metadata(&link) {
+            ensure!(
+                meta.file_type().is_symlink() && fs::read_link(&link)? == Path::new(BINARY),
+                "Refusing to remove unrelated CLI path"
+            );
+            fs::remove_file(link)?;
+        }
     }
     for path in [plist, location(staging, BINARY)] {
         if let Ok(meta) = fs::symlink_metadata(&path) {
